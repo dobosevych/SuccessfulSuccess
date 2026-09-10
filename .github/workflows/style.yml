@@ -1,0 +1,62 @@
+name: Style
+
+# Only on main, as requested. Add `pull_request: branches: [main]` here if you
+# later want the same gates to run before a merge.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A newer push to main supersedes an in-flight run.
+concurrency:
+  group: style-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend — ruff
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: backend/pyproject.toml
+
+      # Pinned to the version the backend image ships, so CI and the container
+      # never disagree about what is a lint error.
+      - name: Lint
+        run: uvx ruff@0.16.6 check --output-format=github .
+
+      - name: Format
+        run: uvx ruff@0.16.6 format --diff .
+
+  frontend:
+    name: Frontend — ESLint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v5
+
+      # Matches the node:22-alpine image the frontend container is built from.
+      - name: Install Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint

@@ -1,5 +1,7 @@
 # SuccessfulSuccess — Meetings
 
+[![Style](https://github.com/dobosevych/SuccessfulSuccess/actions/workflows/style.yml/badge.svg)](https://github.com/dobosevych/SuccessfulSuccess/actions/workflows/style.yml)
+
 A small web app for today's meetings: see what is on today (name, description,
 participants) and add a new one from the UI. Built to `SPEC.md`.
 
@@ -76,6 +78,28 @@ backend/    FastAPI app (api → services → repositories → models), Alembic,
 frontend/   Next.js app, shadcn/ui primitives in components/ui
 docker-compose.yml
 ```
+
+## Continuous integration
+
+`.github/workflows/style.yml` runs on every push to `main` and gates style only:
+
+| Job | Runs | Against |
+|-----|------|---------|
+| Backend — ruff | `ruff check` (GitHub annotations) + `ruff format --diff` | `backend/` |
+| Frontend — ESLint | `npm ci` + `npm run lint` | `frontend/` |
+
+Ruff is pinned to the version the backend image ships (0.16.6) and Node matches
+the container's Node 22, so CI and local containers agree on what passes.
+
+Reproduce either job locally:
+
+```bash
+make lint                                   # both, through the running containers
+cd backend  && uvx ruff@0.16.6 check . && uvx ruff@0.16.6 format --diff .
+cd frontend && npm ci && npm run lint
+```
+
+There is no deploy (CD) stage — no target is configured yet.
 
 ## Development notes
 
