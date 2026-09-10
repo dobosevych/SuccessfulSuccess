@@ -1,0 +1,45 @@
+[project]
+name = "meetings-backend"
+version = "1.0.0"
+description = "FastAPI backend for the SuccessfulSuccess meetings app"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "sqlalchemy[asyncio]>=2.0.30",
+    "asyncpg>=0.29.0",
+    "alembic>=1.13.0",
+    "pydantic>=2.7.0",
+    "pydantic-settings>=2.3.0",
+    "email-validator>=2.1.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2.0",
+    "pytest-asyncio>=0.23.0",
+    "httpx>=0.27.0",
+    "ruff>=0.5.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+# One event loop for the whole run: the engine is module-level, so fixtures and
+# tests must share the loop it was first used on.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "C4"]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's dependency markers are meant to be called in argument defaults.
+extend-immutable-calls = ["fastapi.Query", "fastapi.Depends", "fastapi.Path", "fastapi.Body"]
+
+[tool.uv]
+package = false
