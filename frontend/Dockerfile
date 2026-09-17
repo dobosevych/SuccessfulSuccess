@@ -31,3 +31,18 @@ COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
 USER nextjs
 EXPOSE 3000
 CMD ["node", "server.js"]
+
+# --- static export (used by `make aws-deploy-frontend`) ---------------------
+FROM node:22-alpine AS export-builder
+WORKDIR /app
+ARG NEXT_PUBLIC_API_BASE_URL
+ENV NEXT_TELEMETRY_DISABLED=1 \
+    NEXT_OUTPUT=export \
+    NEXT_PUBLIC_API_BASE_URL=$NEXT_PUBLIC_API_BASE_URL
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+RUN npm run build
+
+# Nothing but the files, so `docker build --output` can drop them on the host.
+FROM scratch AS export
+COPY --from=export-builder /app/out /

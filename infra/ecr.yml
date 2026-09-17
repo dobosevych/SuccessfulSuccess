@@ -1,0 +1,40 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Container registry for the meetings backend image.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: successfulsuccess
+    Description: Prefix for the repository name.
+
+Resources:
+  Repository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${ProjectName}-backend"
+      # Lets `make aws-destroy` delete the repository without emptying it first.
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      # The free tier gives 500 MB of storage, so keep only recent images.
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep the 5 most recent images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 5
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+Outputs:
+  RepositoryUri:
+    Description: Image repository URI (docker push target)
+    Value: !GetAtt Repository.RepositoryUri
