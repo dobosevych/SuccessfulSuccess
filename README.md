@@ -45,18 +45,28 @@ make psql        # psql shell against the app database
 make help        # everything else
 ```
 
-## Deploy the backend to AWS
+## Deploy to AWS
 
-`infra/` holds two CloudFormation templates: `ecr.yml` (image registry) and
-`backend.yml` (the stack below). `make` reads `.env`, so the `aws-*` targets pick
-up the credentials and settings from there — `.env` is gitignored, so real keys
-never reach the repository. The AWS CLI runs in the `amazon/aws-cli` container;
-nothing has to be installed on the host (`AWS=aws make aws-deploy-backend` uses a local
-CLI instead, which is noticeably faster).
+`infra/` holds three CloudFormation templates — `ecr.yml` (image registry),
+`backend.yml` (API) and `frontend.yml` (site) — plus `certificate.sh`, which
+handles ACM. `make` reads `.env`, so the `aws-*` targets pick up the credentials
+and settings from there; `.env` is gitignored, so real keys never reach the
+repository. The AWS CLI runs in the `amazon/aws-cli` container, so nothing has to
+be installed on the host (`AWS=aws make aws-deploy-backend` uses a local CLI
+instead, which is noticeably faster).
 
 ```
-internet → ALB :80 → ECS Fargate task (backend :8000) → RDS PostgreSQL :5432
+                    ┌── /*      → S3 bucket (Next.js static export)
+browser → CloudFront┤
+                    └── /api/*  → ALB :80 → Fargate task :8000 → RDS :5432
 ```
+
+Both stacks stand on their own — the API is reachable at its load balancer
+directly — but routing the site and the API through one CloudFront distribution
+means the browser sees a single origin: no CORS, and no HTTPS page blocked for
+calling a plain-HTTP API.
+
+### Backend — ALB, Fargate, RDS
 
 Everything lands in the account's **default VPC**, in public subnets. Tasks get a
 public IP so they can pull from ECR, which avoids a NAT gateway (~$32/month).
@@ -78,6 +88,7 @@ AWS_DOMAIN=                  # optional: api.example.com, for HTTPS
 ```bash
 make aws-whoami           # check the credentials work
 make aws-deploy-backend   # ECR + build & push + create/update the stack, prints the URL
+make aws-deploy-frontend  # S3 + CloudFront in front of it (see below)
 ```
 
 The first `make aws-deploy-backend` takes ~15 minutes; RDS is the slow part. It is
@@ -90,7 +101,7 @@ idempotent — run it again to ship a new version. Then:
 | `make aws-logs` | Follow the task logs from CloudWatch |
 | `make aws-redeploy` | Push a new image and restart the tasks on it |
 | `make aws-stop` / `aws-start` | Scale the service to 0 / 1 task |
-| `make aws-destroy` | Delete both stacks (asks first — the database goes too) |
+| `make aws-destroy` | Delete every stack (asks first — the database goes too) |
 
 ### HTTPS on a custom domain
 
@@ -128,6 +139,41 @@ parameters emptied, or delete the 443 listener in the console.
 Migrations run on container start (`RUN_MIGRATIONS_ON_START=true`), so a deploy
 applies them automatically.
 
+### Frontend — S3 and CloudFront
+
+The backend has to exist first: the distribution needs its load balancer as an
+origin.
+
+```bash
+make aws-deploy-frontend   # create/update the stack, build, upload, invalidate
+make aws-frontend-url      # print the site URL
+```
+
+One command does the lot: it deploys the stack, builds the Next.js **static
+export** in Docker with `NEXT_PUBLIC_API_BASE_URL` pointed at the site's own URL,
+uploads it to a private S3 bucket, and invalidates the CloudFront cache. Only
+CloudFront can read the bucket (origin access control); nothing in S3 is public.
+
+Two details worth knowing:
+
+- `next build` writes `/meetings/new.html`, but the browser asks for
+  `/meetings/new`. A CloudFront Function rewrites the path at the edge, so
+  clean URLs work without a server.
+- Static assets are uploaded with a one-year immutable cache header and the HTML
+  with `no-cache`, so a deploy is visible immediately while `/_next/*` stays
+  cached. The build is a separate stage in `frontend/Dockerfile`; `output` stays
+  `standalone` for the compose/production image and switches to `export` only
+  when `NEXT_OUTPUT=export` is set, which is the deploy target's job.
+
+For a custom domain, set `AWS_FRONTEND_DOMAIN` in `.env` and run
+`make aws-frontend-cert` before deploying. CloudFront only accepts certificates
+from **us-east-1**, so that target requests it there regardless of `AWS_REGION`.
+Point the domain at the `DistributionDomain` from `make aws-status`.
+
+If the backend has its own certificate, CloudFront switches its API origin to
+`https://$AWS_DOMAIN` automatically — with a certificate attached, the ALB's port
+80 redirects, so an HTTP origin would bounce the browser off to the ALB's name.
+
 ### Cost
 
 The ALB (750 h/month), RDS `db.t3.micro` (750 h + 20 GB) and ECR (500 MB) fit in
@@ -151,8 +197,13 @@ tier — check your billing console rather than assuming.
   the task definition. Moving it to SSM Parameter Store (free) is the first thing
   to harden.
 - ACM certificates are free, so HTTPS adds nothing to the bill.
+- S3 (5 GB) and CloudFront (1 TB out, 10M requests/month, always free) cover a
+  site this size. Cache invalidations are free up to 1,000 paths a month; each
+  deploy spends one.
 - One task, one AZ for the database: a deploy has a few seconds of downtime and
   there is no failover. That is the free-tier shape, not a production one.
+- A trailing slash on a route (`/meetings/new/`) lands on the 404 page. Next.js
+  generates links without one, so this only shows up if a URL is typed that way.
 
 ## API
 
@@ -185,6 +236,7 @@ sent, so every client shows the same time as the day it was listed under.
 ```
 backend/    FastAPI app (api → services → repositories → models), Alembic, tests
 frontend/   Next.js app, shadcn/ui primitives in components/ui
+infra/      CloudFormation templates + the ACM script behind the aws-* targets
 docker-compose.yml
 ```
 

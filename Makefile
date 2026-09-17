@@ -17,6 +17,7 @@ AWS ?= docker run --rm \
 
 APP_STACK ?= $(AWS_RESOURCE_PREFIX)-backend
 ECR_STACK ?= $(AWS_RESOURCE_PREFIX)-ecr
+FRONTEND_STACK ?= $(AWS_RESOURCE_PREFIX)-frontend
 IMAGE_TAG ?= latest
 # X86_64 or ARM64. ARM64 is ~20% cheaper on Fargate and builds natively on
 # Apple Silicon; the image platform is derived from it so the two cannot drift.
@@ -50,7 +51,8 @@ endef
 
 .PHONY: help up up-build down down-v logs ps migrate revision seed test lint fmt shell-backend psql \
         aws-whoami aws-ecr aws-push aws-cert aws-deploy-backend aws-url aws-status aws-logs \
-        aws-redeploy aws-stop aws-start aws-destroy
+        aws-redeploy aws-stop aws-start \
+        aws-frontend-cert aws-deploy-frontend aws-frontend-url aws-destroy
 
 help:
 	@grep -hE '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -199,13 +201,73 @@ aws-start: ## Scale the service back to one task
 		$(AWS) ecs update-service --cluster "$$cluster" --service "$$service" \
 			--desired-count 1 --query 'service.desiredCount' --output text
 
-aws-destroy: ## Delete both stacks, including the database and its data
+aws-frontend-cert: ## Request an HTTPS certificate for AWS_FRONTEND_DOMAIN (CloudFront needs us-east-1)
 	$(require-aws-credentials)
-	@printf 'Delete %s and %s? The RDS instance and all its data go with them (no snapshot). Type yes: ' \
-		"$(APP_STACK)" "$(ECR_STACK)"; \
+	@test -n "$(AWS_FRONTEND_DOMAIN)" || { \
+		echo "AWS_FRONTEND_DOMAIN is empty — set it in .env (e.g. app.example.com)"; exit 1; }
+	@AWS_CERT_REGION=us-east-1 $(CERT) ensure "$(AWS_FRONTEND_DOMAIN)"
+
+aws-deploy-frontend: ## Deploy the frontend to S3 + CloudFront
+	$(require-aws-credentials)
+	@api=$$($(call stack-output,$(APP_STACK),LoadBalancerDomain) 2>/dev/null | tr -d '[:space:]'); \
+		test -n "$$api" -a "$$api" != "None" || { \
+			echo "No backend load balancer found — run: make aws-deploy-backend"; exit 1; }; \
+		proto=http-only; \
+		if [ -n "$(AWS_DOMAIN)" ] && [ -n "$$($(CERT) find "$(AWS_DOMAIN)")" ]; then \
+			api="$(AWS_DOMAIN)"; proto=https-only; \
+		fi; \
+		https=""; \
+		if [ -n "$(AWS_FRONTEND_DOMAIN)" ]; then \
+			cert=$$(AWS_CERT_REGION=us-east-1 $(CERT) find "$(AWS_FRONTEND_DOMAIN)"); \
+			test -n "$$cert" || { \
+				echo "No issued us-east-1 certificate for $(AWS_FRONTEND_DOMAIN) — run: make aws-frontend-cert"; \
+				exit 1; }; \
+			https="DomainName=$(AWS_FRONTEND_DOMAIN) CertificateArn=$$cert"; \
+		fi; \
+		echo "api origin: $$proto $$api"; \
+		echo "A new CloudFront distribution takes ~5 minutes to come up."; \
+		$(AWS) cloudformation deploy \
+			--stack-name $(FRONTEND_STACK) \
+			--template-file infra/frontend.yml \
+			--no-fail-on-empty-changeset \
+			--parameter-overrides \
+				"ProjectName=$(AWS_RESOURCE_PREFIX)" \
+				"ApiOriginDomain=$$api" \
+				"ApiOriginProtocol=$$proto" \
+				$$https
+	@url=$$($(call stack-output,$(FRONTEND_STACK),SiteUrl) | tr -d '[:space:]'); \
+		bucket=$$($(call stack-output,$(FRONTEND_STACK),BucketName) | tr -d '[:space:]'); \
+		dist=$$($(call stack-output,$(FRONTEND_STACK),DistributionId) | tr -d '[:space:]'); \
+		echo "Building the static export against $$url"; \
+		rm -rf frontend/out; \
+		docker build --target export --output type=local,dest=frontend/out \
+			--build-arg NEXT_PUBLIC_API_BASE_URL="$$url" ./frontend; \
+		echo "Uploading to s3://$$bucket"; \
+		$(AWS) s3 sync frontend/out "s3://$$bucket" --delete --exclude "*.html" \
+			--cache-control "public,max-age=31536000,immutable" --only-show-errors; \
+		$(AWS) s3 sync frontend/out "s3://$$bucket" --delete --exclude "*" --include "*.html" \
+			--cache-control "no-cache" --only-show-errors; \
+		$(AWS) cloudfront create-invalidation --distribution-id "$$dist" --paths "/*" \
+			--query 'Invalidation.Status' --output text; \
+		echo "$$url"
+
+aws-frontend-url: ## Print the deployed site URL
+	@$(call stack-output,$(FRONTEND_STACK),SiteUrl)
+
+aws-destroy: ## Delete every stack, including the database and its data
+	$(require-aws-credentials)
+	@printf 'Delete %s, %s and %s? The RDS instance and all its data go with them (no snapshot). Type yes: ' \
+		"$(FRONTEND_STACK)" "$(APP_STACK)" "$(ECR_STACK)"; \
 		read answer; test "$$answer" = "yes" || { echo "Aborted."; exit 1; }
+	@bucket=$$($(call stack-output,$(FRONTEND_STACK),BucketName) 2>/dev/null | tr -d '[:space:]'); \
+		if [ -n "$$bucket" ] && [ "$$bucket" != "None" ]; then \
+			echo "Emptying s3://$$bucket"; \
+			$(AWS) s3 rm "s3://$$bucket" --recursive --only-show-errors || true; \
+		fi
+	-$(AWS) cloudformation delete-stack --stack-name $(FRONTEND_STACK)
+	-$(AWS) cloudformation wait stack-delete-complete --stack-name $(FRONTEND_STACK)
 	$(AWS) cloudformation delete-stack --stack-name $(APP_STACK)
 	$(AWS) cloudformation wait stack-delete-complete --stack-name $(APP_STACK)
 	$(AWS) cloudformation delete-stack --stack-name $(ECR_STACK)
 	$(AWS) cloudformation wait stack-delete-complete --stack-name $(ECR_STACK)
-	@echo "Both stacks deleted."
+	@echo "All stacks deleted."

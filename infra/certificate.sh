@@ -14,7 +14,15 @@ set -euo pipefail
 
 AWS_CLI=${AWS_CLI:-aws}
 
-run() { $AWS_CLI "$@"; }
+# AWS_CERT_REGION overrides the CLI's region: CloudFront only reads
+# certificates from us-east-1, wherever the rest of the stack lives.
+run() {
+  if [ -n "${AWS_CERT_REGION:-}" ]; then
+    $AWS_CLI --region "$AWS_CERT_REGION" "$@"
+  else
+    $AWS_CLI "$@"
+  fi
+}
 say() { printf '%s\n' "$*" >&2; }
 
 # ACM and the CLI say "None" where a shell wants an empty string.
