@@ -1,0 +1,254 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Meetings frontend: the Next.js static export in a private S3 bucket, served
+  over HTTPS by CloudFront through origin access control, optionally on a
+  custom domain. The browser calls the backend's Lambda function URL directly;
+  FastAPI's CORS settings allow it. The distribution is on CloudFront's
+  flat-rate Free plan. Deployed in us-east-1 with everything else, which is
+  also the only region CloudFront reads certificates and web ACLs from.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: successfulsuccess
+    Description: Prefix for the names of the resources in this stack.
+
+  DomainName:
+    Type: String
+    Default: ""
+    Description: >-
+      Optional custom domain for the site (app.example.com). Needs
+      CertificateArn. Empty serves the site on the distribution's own
+      *.cloudfront.net name.
+
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: >-
+      ACM certificate for DomainName, issued in us-east-1
+      (`make aws-frontend-cert` requests and validates it).
+
+  HostedZoneId:
+    Type: String
+    Default: ""
+    Description: >-
+      Route 53 hosted zone serving DomainName. When set, the stack points the
+      domain at the distribution; otherwise add a CNAME to the distribution's
+      domain at your DNS provider.
+
+  PricingPlan:
+    Type: String
+    Default: FREE
+    AllowedValues: [FREE, PAY_AS_YOU_GO]
+    Description: >-
+      FREE subscribes the distribution to CloudFront's flat-rate Free plan
+      ($0/month, 1M requests and 100 GB a month, no overage charges; at most 3
+      per account). AWS refuses it for accounts still on the AWS Free Tier;
+      PAY_AS_YOU_GO skips the subscription there.
+
+Conditions:
+  HasFreePlan: !Equals [!Ref PricingPlan, FREE]
+  HasDomain: !Not [!Equals [!Ref DomainName, ""]]
+  HasZone: !And
+    - !Condition HasDomain
+    - !Not [!Equals [!Ref HostedZoneId, ""]]
+
+Resources:
+  Bucket:
+    Type: AWS::S3::Bucket
+    # Emptied by `make aws-destroy` before the stack goes.
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub "${ProjectName}-frontend-${AWS::AccountId}"
+      # Only CloudFront reads the bucket, so it stays fully private.
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
+
+  # Origin access control and CloudFront functions take no tags.
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${ProjectName}-frontend"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # The export is built with trailingSlash, so /meetings/new/ lives at
+  # meetings/new/index.html. S3's REST endpoint has no index documents, so map
+  # every extension-less path onto its folder's index.html here.
+  IndexRewriteFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub "${ProjectName}-index-rewrite"
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Serve folder/index.html for clean URLs
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          var uri = request.uri;
+          if (uri.endsWith('/')) {
+            request.uri = uri + 'index.html';
+          } else if (uri.split('/').pop().indexOf('.') === -1) {
+            request.uri = uri + '/index.html';
+          }
+          return request;
+        }
+
+  # Every flat-rate plan needs a web ACL of its own on the distribution. This
+  # one only allows: the plan's DDoS protection applies either way, and WAF
+  # rules can be added later at no extra cost.
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub "${ProjectName}-frontend"
+      Scope: CLOUDFRONT
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "${ProjectName}-frontend"
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub "${ProjectName} frontend"
+        Enabled: true
+        WebACLId: !GetAtt WebAcl.Arn
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        DefaultRootObject: index.html
+        Aliases: !If [HasDomain, [!Ref DomainName], !Ref "AWS::NoValue"]
+        ViewerCertificate: !If
+          - HasDomain
+          - AcmCertificateArn: !Ref CertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+        Origins:
+          - Id: site
+            DomainName: !GetAtt Bucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: site
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6   # Managed-CachingOptimized
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt IndexRewriteFunction.FunctionMetadata.FunctionARN
+        # Without s3:ListBucket a missing key comes back 403, not 404.
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 404
+            ResponsePagePath: /404.html
+            ErrorCachingMinTTL: 60
+          - ErrorCode: 404
+            ResponseCode: 404
+            ResponsePagePath: /404.html
+            ErrorCachingMinTTL: 60
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
+
+  # The Free plan activates immediately. It takes no tags, and CloudFormation
+  # cancels it (immediately, for Free) before deleting the distribution.
+  PricingPlanSubscription:
+    Type: AWS::PricingPlanManager::Subscription
+    Condition: HasFreePlan
+    Properties:
+      PlanFamily: CloudFront
+      PlanTier: FREE
+      UsageLevel: DEFAULT
+      ResourceArns:
+        - !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+        - !GetAtt WebAcl.Arn
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Bucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: CloudFrontRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${Bucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+
+  # Route 53 records take no tags.
+  AliasRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2   # CloudFront's fixed zone id
+
+  AliasRecordIpv6:
+    Type: AWS::Route53::RecordSet
+    Condition: HasZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+Outputs:
+  SiteUrl:
+    Description: Where the app is served (the custom domain when there is one)
+    Value: !If
+      - HasDomain
+      - !Sub "https://${DomainName}"
+      - !Sub "https://${Distribution.DomainName}"
+  DistributionDomain:
+    Description: Point a custom domain's CNAME here when its DNS is not in Route 53
+    Value: !GetAtt Distribution.DomainName
+  AllowedOrigins:
+    Description: Every origin the site is served from, for the backend's CORS
+    Value: !If
+      - HasDomain
+      - !Sub "https://${Distribution.DomainName},https://${DomainName}"
+      - !Sub "https://${Distribution.DomainName}"
+  BucketName:
+    Value: !Ref Bucket
+  DistributionId:
+    Value: !Ref Distribution
+  PricingPlanStatus:
+    Description: ACTIVE once the distribution is on the Free plan
+    Value: !If [HasFreePlan, !GetAtt PricingPlanSubscription.Status, PAY_AS_YOU_GO]

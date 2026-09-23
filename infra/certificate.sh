@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ACM certificates for the API's custom domain. Driven by `make aws-cert`.
+# ACM certificates for the frontend's custom domain. Driven by `make aws-frontend-cert`.
 #
 #   ensure <domain>   reuse or request a certificate, see it through DNS
 #                     validation, print its ARN
@@ -15,7 +15,8 @@ set -euo pipefail
 AWS_CLI=${AWS_CLI:-aws}
 
 # AWS_CERT_REGION overrides the CLI's region: CloudFront only reads
-# certificates from us-east-1, wherever the rest of the stack lives.
+# certificates from us-east-1. The Makefile always passes it, so the certificate
+# lands there even if AWS_REGION ever changes.
 run() {
   if [ -n "${AWS_CERT_REGION:-}" ]; then
     $AWS_CLI --region "$AWS_CERT_REGION" "$@"
@@ -104,7 +105,7 @@ ensure() {
     sleep 2
   done
   if [ -z "$name" ]; then
-    say "ACM has not published a validation record yet. Re-run: make aws-cert"
+    say "ACM has not published a validation record yet. Re-run: make aws-frontend-cert"
     return 1
   fi
 
@@ -121,7 +122,7 @@ ensure() {
     say "  name  ${name%.}"
     say "  value ${value%.}"
     say ""
-    say "Waiting for validation (Ctrl-C is safe: re-run make aws-cert to resume)."
+    say "Waiting for validation (Ctrl-C is safe: re-run make aws-frontend-cert to resume)."
   fi
 
   run acm wait certificate-validated --certificate-arn "$arn" >&2

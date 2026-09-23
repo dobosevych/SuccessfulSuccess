@@ -1,8 +1,9 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
-  Meetings backend on AWS: an internet-facing ALB in front of an ECS Fargate
-  service talking to a private RDS PostgreSQL instance. The ALB and the database
-  are sized for the free tier; Fargate has no free tier (see README).
+  Meetings backend on AWS: a Lambda function (container image) behind its own
+  function URL, talking to a private Aurora Serverless v2 PostgreSQL cluster
+  that pauses (scales to zero) when idle. The same function applies the
+  migrations when invoked directly.
 
 Parameters:
   ProjectName:
@@ -17,44 +18,71 @@ Parameters:
   SubnetIds:
     Type: List<AWS::EC2::Subnet::Id>
     Description: >-
-      At least two public subnets in different availability zones. The ALB needs
-      two AZs; the tasks get public IPs so they can pull from ECR, which keeps
-      the stack free of a paid NAT gateway.
+      At least two subnets in different availability zones: Aurora needs two
+      for its subnet group, and the function attaches to the same ones. It only
+      ever talks to the database, so it needs no NAT gateway.
 
   ImageUri:
     Type: String
-    Description: Backend image to run, e.g. <account>.dkr.ecr.<region>.amazonaws.com/<repo>:latest
-
-  TaskCpu:
-    Type: String
-    Default: "256"
-    AllowedValues: ["256", "512", "1024"]
-    Description: Fargate task CPU units (256 = 0.25 vCPU, the cheapest size).
-
-  TaskMemory:
-    Type: String
-    Default: "512"
-    Description: Fargate task memory in MiB; must be valid for the chosen CPU.
-
-  CpuArchitecture:
-    Type: String
-    Default: X86_64
-    AllowedValues: [X86_64, ARM64]
     Description: >-
-      Must match the platform the image was built for. ARM64 Fargate is ~20%
+      Backend image, pinned by digest so every push changes the template:
+      <account>.dkr.ecr.<region>.amazonaws.com/<repo>@sha256:...
+
+  Architecture:
+    Type: String
+    Default: x86_64
+    AllowedValues: [x86_64, arm64]
+    Description: >-
+      Must match the platform the image was built for. arm64 Lambda is ~20%
       cheaper and builds natively on Apple Silicon.
 
-  DesiredCount:
+  MemorySize:
+    Type: Number
+    Default: 512
+    MinValue: 128
+    MaxValue: 10240
+    Description: API function memory in MB; CPU scales with it.
+
+  MaxConcurrency:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    Description: >-
+      Reserved concurrency: the most function instances running at once. Each
+      warm instance holds one database connection. 0 reserves nothing, leaving
+      the account's own limit as the cap; new accounts get 10 in total, and
+      Lambda refuses any reservation that leaves fewer than 10 unreserved.
+      Raise it once the account's limit has been increased.
+
+  DbEngineVersion:
+    Type: String
+    Default: ""
+    Description: >-
+      Aurora PostgreSQL version. Empty uses the region's current default, which
+      supports pausing at 0 ACU (that needs 13.15+, 14.12+, 15.7+ or 16.3+).
+
+  DbMinCapacity:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    Description: >-
+      Lowest Aurora capacity in ACUs. 0 lets the cluster pause when idle, so it
+      bills only for storage until the next connection wakes it (~15 s).
+
+  DbMaxCapacity:
     Type: Number
     Default: 1
-    MinValue: 0
-    MaxValue: 2
-    Description: Running tasks. Set to 0 to stop paying for compute (`make aws-stop`).
+    MinValue: 1
+    Description: >-
+      Highest Aurora capacity in ACUs (1 ACU ~ 2 GB of memory). 1 is the
+      smallest Aurora allows, and plenty for this app.
 
-  DbInstanceClass:
-    Type: String
-    Default: db.t3.micro
-    Description: RDS instance class (db.t3.micro is free-tier eligible).
+  DbAutoPauseSeconds:
+    Type: Number
+    Default: 300
+    MinValue: 300
+    MaxValue: 86400
+    Description: Idle seconds before a cluster with DbMinCapacity 0 pauses.
 
   DbName:
     Type: String
@@ -93,80 +121,23 @@ Parameters:
     Default: "false"
     AllowedValues: ["true", "false"]
 
-  DomainName:
-    Type: String
-    Default: ""
-    Description: >-
-      Custom domain for the API, e.g. api.example.com. Empty means the ALB's own
-      DNS name over plain HTTP.
-
-  CertificateArn:
-    Type: String
-    Default: ""
-    Description: >-
-      ACM certificate covering DomainName, in this region. `make aws-cert`
-      requests and validates it. Empty means no HTTPS listener.
-
-  HostedZoneId:
-    Type: String
-    Default: ""
-    Description: >-
-      Route 53 public hosted zone serving DomainName. Empty means you point the
-      domain at the ALB yourself, with a CNAME at your DNS provider.
-
 Conditions:
-  # Both are needed: a certificate with no domain has nothing to serve.
-  HasCertificate: !And
-    - !Not [!Equals [!Ref CertificateArn, ""]]
-    - !Not [!Equals [!Ref DomainName, ""]]
-
-  HasHostedZone: !And
-    - !Condition HasCertificate
-    - !Not [!Equals [!Ref HostedZoneId, ""]]
+  HasDbEngineVersion: !Not [!Equals [!Ref DbEngineVersion, ""]]
+  HasMaxConcurrency: !Not [!Equals [!Ref MaxConcurrency, 0]]
 
 Resources:
   # --- networking -----------------------------------------------------------
 
-  AlbSecurityGroup:
+  FunctionSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: !Sub "${ProjectName} load balancer"
+      GroupDescription: !Sub "${ProjectName} backend function"
       VpcId: !Ref VpcId
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 80
-          ToPort: 80
-          CidrIp: 0.0.0.0/0
-          Description: Public HTTP
       Tags:
         - Key: Name
-          Value: !Sub "${ProjectName}-alb"
-
-  AlbHttpsIngress:
-    Type: AWS::EC2::SecurityGroupIngress
-    Condition: HasCertificate
-    Properties:
-      GroupId: !Ref AlbSecurityGroup
-      IpProtocol: tcp
-      FromPort: 443
-      ToPort: 443
-      CidrIp: 0.0.0.0/0
-      Description: Public HTTPS
-
-  ServiceSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: !Sub "${ProjectName} backend tasks"
-      VpcId: !Ref VpcId
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 8000
-          ToPort: 8000
-          SourceSecurityGroupId: !Ref AlbSecurityGroup
-          Description: ALB to task
-      Tags:
-        - Key: Name
-          Value: !Sub "${ProjectName}-service"
+          Value: !Sub "${ProjectName}-function"
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
 
   DbSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -177,11 +148,13 @@ Resources:
         - IpProtocol: tcp
           FromPort: 5432
           ToPort: 5432
-          SourceSecurityGroupId: !Ref ServiceSecurityGroup
-          Description: Tasks to PostgreSQL
+          SourceSecurityGroupId: !Ref FunctionSecurityGroup
+          Description: Function to PostgreSQL
       Tags:
         - Key: Name
           Value: !Sub "${ProjectName}-db"
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
 
   # --- database -------------------------------------------------------------
 
@@ -190,269 +163,168 @@ Resources:
     Properties:
       DBSubnetGroupDescription: !Sub "${ProjectName} database subnets"
       SubnetIds: !Ref SubnetIds
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
 
-  Database:
-    Type: AWS::RDS::DBInstance
+  DbCluster:
+    Type: AWS::RDS::DBCluster
     # A demo stack: `make aws-destroy` should leave nothing billable behind.
     # The default (Snapshot) would keep charging for snapshot storage.
     DeletionPolicy: Delete
     UpdateReplacePolicy: Delete
     Properties:
-      DBInstanceIdentifier: !Sub "${ProjectName}-db"
-      Engine: postgres
-      DBInstanceClass: !Ref DbInstanceClass
-      AllocatedStorage: "20"          # free tier: 20 GB
-      StorageType: gp2
-      StorageEncrypted: true
-      DBName: !Ref DbName
+      DBClusterIdentifier: !Sub "${ProjectName}-db"
+      Engine: aurora-postgresql
+      EngineVersion: !If [HasDbEngineVersion, !Ref DbEngineVersion, !Ref "AWS::NoValue"]
+      DatabaseName: !Ref DbName
       MasterUsername: !Ref DbUsername
       MasterUserPassword: !Ref DbPassword
       DBSubnetGroupName: !Ref DbSubnetGroup
-      VPCSecurityGroups:
+      VpcSecurityGroupIds:
         - !Ref DbSecurityGroup
-      PubliclyAccessible: false
-      MultiAZ: false                  # Multi-AZ is not free tier
-      BackupRetentionPeriod: 0        # no automated backups, no snapshot storage
+      StorageEncrypted: true
+      BackupRetentionPeriod: 1        # Aurora's minimum; the continuous backup is free up to the cluster size
       DeletionProtection: false
-      AutoMinorVersionUpgrade: true
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: !Ref DbMinCapacity
+        MaxCapacity: !Ref DbMaxCapacity
+        SecondsUntilAutoPause: !Ref DbAutoPauseSeconds
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
 
-  # --- cluster --------------------------------------------------------------
-
-  Cluster:
-    Type: AWS::ECS::Cluster
+  # Serverless v2 capacity lives on instances; one writer is enough here.
+  DbInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
     Properties:
-      ClusterName: !Sub "${ProjectName}-cluster"
-      CapacityProviders:
-        - FARGATE
-      ClusterSettings:
-        - Name: containerInsights
-          Value: disabled             # Container Insights bills as custom metrics
+      DBInstanceIdentifier: !Sub "${ProjectName}-db-1"
+      DBClusterIdentifier: !Ref DbCluster
+      Engine: aurora-postgresql
+      DBInstanceClass: db.serverless
+      PubliclyAccessible: false
+      AutoMinorVersionUpgrade: true
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
 
-  TaskExecutionRole:
+  # --- function -------------------------------------------------------------
+
+  FunctionRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
           - Effect: Allow
-            Principal: { Service: ecs-tasks.amazonaws.com }
+            Principal: { Service: lambda.amazonaws.com }
             Action: sts:AssumeRole
       ManagedPolicyArns:
-        # Pull the image from ECR and write the task's logs.
-        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
-
-  TaskRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal: { Service: ecs-tasks.amazonaws.com }
-            Action: sts:AssumeRole
-      Policies:
-        # Enough for `aws ecs execute-command` (a shell in the running task).
-        - PolicyName: ecs-exec
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action:
-                  - ssmmessages:CreateControlChannel
-                  - ssmmessages:CreateDataChannel
-                  - ssmmessages:OpenControlChannel
-                  - ssmmessages:OpenDataChannel
-                Resource: "*"
-
-  # --- load balancer --------------------------------------------------------
-
-  LoadBalancer:
-    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
-    Properties:
-      Name: !Sub "${ProjectName}-alb"
-      Type: application
-      Scheme: internet-facing
-      Subnets: !Ref SubnetIds
-      SecurityGroups:
-        - !Ref AlbSecurityGroup
-
-  TargetGroup:
-    Type: AWS::ElasticLoadBalancingV2::TargetGroup
-    Properties:
-      Name: !Sub "${ProjectName}-tg"
-      VpcId: !Ref VpcId
-      Protocol: HTTP
-      Port: 8000
-      TargetType: ip                  # awsvpc tasks register by IP, not instance
-      HealthCheckPath: /health
-      HealthCheckPort: traffic-port
-      HealthCheckIntervalSeconds: 30
-      HealthCheckTimeoutSeconds: 5
-      HealthyThresholdCount: 2
-      UnhealthyThresholdCount: 3
-      Matcher:
-        HttpCode: "200"
-      TargetGroupAttributes:
-        - Key: deregistration_delay.timeout_seconds
-          Value: "15"
-
-  Listener:
-    Type: AWS::ElasticLoadBalancingV2::Listener
-    Properties:
-      LoadBalancerArn: !Ref LoadBalancer
-      Port: 80
-      Protocol: HTTP
-      DefaultActions:
-        # With a certificate in place port 80 only sends callers to port 443.
-        - !If
-          - HasCertificate
-          - Type: redirect
-            RedirectConfig:
-              Protocol: HTTPS
-              Port: "443"
-              Host: "#{host}"
-              Path: "/#{path}"
-              Query: "#{query}"
-              StatusCode: HTTP_301
-          - Type: forward
-            TargetGroupArn: !Ref TargetGroup
-
-  HttpsListener:
-    Type: AWS::ElasticLoadBalancingV2::Listener
-    Condition: HasCertificate
-    Properties:
-      LoadBalancerArn: !Ref LoadBalancer
-      Port: 443
-      Protocol: HTTPS
-      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
-      Certificates:
-        - CertificateArn: !Ref CertificateArn
-      DefaultActions:
-        - Type: forward
-          TargetGroupArn: !Ref TargetGroup
-
-  # Only when Route 53 serves the domain; otherwise add the CNAME yourself.
-  DnsRecord:
-    Type: AWS::Route53::RecordSet
-    Condition: HasHostedZone
-    Properties:
-      HostedZoneId: !Ref HostedZoneId
-      Name: !Ref DomainName
-      Type: A
-      AliasTarget:
-        DNSName: !GetAtt LoadBalancer.DNSName
-        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
-        EvaluateTargetHealth: false
-
-  # --- service --------------------------------------------------------------
+        # Write logs, and manage the network interfaces a VPC function needs.
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
 
   LogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub "/ecs/${ProjectName}"
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-backend"
       RetentionInDays: 7
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
 
-  TaskDefinition:
-    Type: AWS::ECS::TaskDefinition
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    # Migrations run right after the stack settles, so the writer must exist.
+    DependsOn: DbInstance
     Properties:
-      Family: !Sub "${ProjectName}-backend"
-      NetworkMode: awsvpc
-      RequiresCompatibilities:
-        - FARGATE
-      Cpu: !Ref TaskCpu
-      Memory: !Ref TaskMemory
-      RuntimePlatform:
-        OperatingSystemFamily: LINUX
-        CpuArchitecture: !Ref CpuArchitecture
-      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
-      TaskRoleArn: !GetAtt TaskRole.Arn
-      ContainerDefinitions:
-        - Name: backend
-          Image: !Ref ImageUri
-          Essential: true
-          PortMappings:
-            - ContainerPort: 8000
-              Protocol: tcp
-          Environment:
-            # NOTE: the password ends up readable in the task definition. Moving
-            # it to SSM Parameter Store is the first thing to harden here.
-            - Name: DATABASE_URL
-              Value: !Sub
-                - "postgresql+asyncpg://${DbUsername}:${DbPassword}@${Endpoint}:${Port}/${DbName}"
-                - Endpoint: !GetAtt Database.Endpoint.Address
-                  Port: !GetAtt Database.Endpoint.Port
-            - Name: APP_TIMEZONE
-              Value: !Ref AppTimezone
-            - Name: CORS_ORIGINS
-              Value: !Ref CorsOrigins
-            - Name: LOG_LEVEL
-              Value: !Ref LogLevel
-            - Name: RUN_MIGRATIONS_ON_START
-              Value: "true"
-            - Name: SEED_DEMO_DATA
-              Value: !Ref SeedDemoData
-          LogConfiguration:
-            LogDriver: awslogs
-            Options:
-              awslogs-group: !Ref LogGroup
-              awslogs-region: !Ref AWS::Region
-              awslogs-stream-prefix: backend
+      FunctionName: !Sub "${ProjectName}-backend"
+      Description: Meetings API (FastAPI through Mangum)
+      PackageType: Image
+      Code:
+        ImageUri: !Ref ImageUri
+      Architectures:
+        - !Ref Architecture
+      Role: !GetAtt FunctionRole.Arn
+      MemorySize: !Ref MemorySize
+      ReservedConcurrentExecutions: !If [HasMaxConcurrency, !Ref MaxConcurrency, !Ref "AWS::NoValue"]
+      # A paused cluster takes ~15 s to resume on the first connection, so
+      # leave room for that on top of the request itself.
+      Timeout: 60
+      LoggingConfig:
+        LogGroup: !Ref LogGroup
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref FunctionSecurityGroup
+      Environment:
+        Variables:
+          # NOTE: the password ends up readable in the function configuration.
+          # Moving it to SSM Parameter Store is the first thing to harden here.
+          DATABASE_URL: !Sub
+            - "postgresql+asyncpg://${DbUsername}:${DbPassword}@${Endpoint}:${Port}/${DbName}"
+            - Endpoint: !GetAtt DbCluster.Endpoint.Address
+              Port: !GetAtt DbCluster.Endpoint.Port
+          APP_TIMEZONE: !Ref AppTimezone
+          CORS_ORIGINS: !Ref CorsOrigins
+          LOG_LEVEL: !Ref LogLevel
+          SEED_DEMO_DATA: !Ref SeedDemoData
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
 
-  Service:
-    Type: AWS::ECS::Service
-    DependsOn: Listener
+  # --- function URL ---------------------------------------------------------
+
+  # The function's own HTTPS endpoint (https://<id>.lambda-url.<region>.on.aws).
+  # Public: the app has no authentication, as locally. CORS stays in FastAPI;
+  # configuring it here too would override the app's headers. The URL and the
+  # permissions below take no tags.
+  FunctionUrl:
+    Type: AWS::Lambda::Url
     Properties:
-      ServiceName: !Sub "${ProjectName}-backend"
-      Cluster: !Ref Cluster
-      TaskDefinition: !Ref TaskDefinition
-      LaunchType: FARGATE
-      PlatformVersion: LATEST
-      DesiredCount: !Ref DesiredCount
-      EnableExecuteCommand: true
-      DeploymentConfiguration:
-        MinimumHealthyPercent: 100
-        MaximumPercent: 200
-      HealthCheckGracePeriodSeconds: 180   # migrations run before the app serves
-      NetworkConfiguration:
-        AwsvpcConfiguration:
-          Subnets: !Ref SubnetIds
-          SecurityGroups:
-            - !Ref ServiceSecurityGroup
-          # Public subnets + public IP = ECR reachable without a NAT gateway.
-          AssignPublicIp: ENABLED
-      LoadBalancers:
-        - ContainerName: backend
-          ContainerPort: 8000
-          TargetGroupArn: !Ref TargetGroup
+      TargetFunctionArn: !GetAtt ApiFunction.Arn
+      AuthType: NONE
+      InvokeMode: BUFFERED
+
+  # A public URL needs both statements: InvokeFunctionUrl for the URL itself,
+  # and InvokeFunction limited to calls that arrive through it.
+  FunctionUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  FunctionUrlInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunction
+      Principal: "*"
+      InvokedViaFunctionUrl: true
 
 Outputs:
   ApiUrl:
-    Description: Base URL of the backend
-    Value: !If
-      - HasCertificate
-      - !Sub "https://${DomainName}"
-      - !Sub "http://${LoadBalancer.DNSName}"
+    Description: Base URL of the backend (the function URL, without its trailing slash)
+    Value: !Sub ["https://${Host}", {Host: !Select [2, !Split ["/", !GetAtt FunctionUrl.FunctionUrl]]}]
   HealthUrl:
     Description: Health check
-    Value: !If
-      - HasCertificate
-      - !Sub "https://${DomainName}/health"
-      - !Sub "http://${LoadBalancer.DNSName}/health"
+    Value: !Sub ["https://${Host}/health", {Host: !Select [2, !Split ["/", !GetAtt FunctionUrl.FunctionUrl]]}]
   DocsUrl:
     Description: Swagger UI
-    Value: !If
-      - HasCertificate
-      - !Sub "https://${DomainName}/docs"
-      - !Sub "http://${LoadBalancer.DNSName}/docs"
-  LoadBalancerDomain:
-    Description: The ALB's own name — point your DNS at this (CNAME)
-    Value: !GetAtt LoadBalancer.DNSName
+    Value: !Sub ["https://${Host}/docs", {Host: !Select [2, !Split ["/", !GetAtt FunctionUrl.FunctionUrl]]}]
+  FunctionUrlDomain:
+    Description: The function URL's host name
+    Value: !Select [2, !Split ["/", !GetAtt FunctionUrl.FunctionUrl]]
   DatabaseEndpoint:
-    Description: RDS endpoint (private to the VPC)
-    Value: !GetAtt Database.Endpoint.Address
-  ClusterName:
-    Value: !Ref Cluster
-  ServiceName:
-    Value: !GetAtt Service.Name
+    Description: Aurora cluster (writer) endpoint, private to the VPC
+    Value: !GetAtt DbCluster.Endpoint.Address
+  FunctionName:
+    Value: !Ref ApiFunction
   LogGroupName:
     Value: !Ref LogGroup

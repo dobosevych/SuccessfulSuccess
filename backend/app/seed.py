@@ -4,6 +4,8 @@ import asyncio
 import logging
 from datetime import datetime, time
 
+from sqlalchemy.ext.asyncio import async_sessionmaker
+
 from app.config import settings
 from app.db import SessionFactory
 from app.models import Meeting, Participant
@@ -39,8 +41,8 @@ DEMO = [
 ]
 
 
-async def seed_if_empty() -> None:
-    async with SessionFactory() as session:
+async def seed_if_empty(session_factory: async_sessionmaker = SessionFactory) -> None:
+    async with session_factory() as session:
         if await MeetingRepository(session).count():
             logger.info("Database already has meetings; skipping demo seed.")
             return

@@ -47,145 +47,174 @@ make help        # everything else
 
 ## Deploy to AWS
 
-`infra/` holds three CloudFormation templates — `ecr.yml` (image registry),
-`backend.yml` (API) and `frontend.yml` (site) — plus `certificate.sh`, which
-handles ACM. `make` reads `.env`, so the `aws-*` targets pick up the credentials
-and settings from there; `.env` is gitignored, so real keys never reach the
-repository. The AWS CLI runs in the `amazon/aws-cli` container, so nothing has to
-be installed on the host (`AWS=aws make aws-deploy-backend` uses a local CLI
-instead, which is noticeably faster).
+`infra/` holds three CloudFormation templates: `ecr.yml` (image registry),
+`backend.yml` (API and database) and `frontend.yml` (site). `make` reads `.env`,
+so the `aws-*` targets pick up the credentials and settings from there; `.env` is
+gitignored, so real keys never reach the repository. The AWS CLI runs in the
+`amazon/aws-cli` container, so nothing has to be installed on the host besides
+Docker (`AWS=aws make aws-deploy` uses a local CLI instead, which is noticeably
+faster).
 
 ```
-                    ┌── /*      → S3 bucket (Next.js static export)
-browser → CloudFront┤
-                    └── /api/*  → ALB :80 → Fargate task :8000 → RDS :5432
+browser ──https──→ CloudFront (optional custom domain) → private S3 bucket (Next.js static export)
+   └────https──→ Lambda function URL → Lambda → Aurora Serverless v2 :5432
 ```
 
-Both stacks stand on their own — the API is reachable at its load balancer
-directly — but routing the site and the API through one CloudFront distribution
-means the browser sees a single origin: no CORS, and no HTTPS page blocked for
-calling a plain-HTTP API.
+Every resource lives in `AWS_REGION`, **us-east-1** by default, which is also
+where CloudFront reads its certificates from. There is no API Gateway or load
+balancer: the browser calls the API on its function URL, and FastAPI's CORS
+settings allow it.
 
-### Backend — ALB, Fargate, RDS
+Every stack is tagged `PROJECT_NAME=<value of PROJECT_NAME>`, and every resource
+that accepts tags also carries it explicitly in the templates. Filter by it in
+Cost Explorer or Resource Groups to see everything the project owns.
 
-Everything lands in the account's **default VPC**, in public subnets. Tasks get a
-public IP so they can pull from ECR, which avoids a NAT gateway (~$32/month).
-Only the ALB is reachable from the internet: the task's security group accepts
-traffic from the ALB alone, and the database's accepts it from the task alone.
+### One command
 
-Fill these in `.env` first, then deploy:
+```bash
+make aws-whoami   # check the credentials work
+make aws-deploy   # backend first, then the frontend built against the backend's URL
+```
+
+`aws-deploy` runs the two steps below in order: the frontend bakes the API URL
+into its build, so the backend has to exist first. Each step can also run on its
+own.
+
+Fill these in `.env` first:
 
 ```bash
 AWS_ACCESS_KEY_ID=...        # an IAM user, not root access keys
 AWS_SECRET_ACCESS_KEY=...
-AWS_REGION=eu-central-1
-AWS_RESOURCE_PREFIX=successfulsuccess   # prefixes every resource name
+AWS_REGION=us-east-1
+PROJECT_NAME=successfulsuccess   # prefixes every resource name, and the PROJECT_NAME tag
 AWS_DB_PASSWORD=...          # 8-41 chars, [A-Za-z0-9_-] only
-AWS_CORS_ORIGINS=*           # the frontend's origin once it has one
-AWS_DOMAIN=                  # optional: api.example.com, for HTTPS
+AWS_CORS_ORIGINS=            # empty: follow the frontend's URLs (* until it exists)
+AWS_SEED_DEMO_DATA=false     # true seeds demo meetings into an empty database
+AWS_FRONTEND_DOMAIN=         # optional, e.g. app.example.com
 ```
+
+### 1. Backend — Lambda function URL, Aurora Serverless v2
 
 ```bash
-make aws-whoami           # check the credentials work
-make aws-deploy-backend   # ECR + build & push + create/update the stack, prints the URL
-make aws-deploy-frontend  # S3 + CloudFront in front of it (see below)
+make aws-deploy-backend   # ECR + build & push + create/update the stack + migrate, prints the URL
 ```
 
-The first `make aws-deploy-backend` takes ~15 minutes; RDS is the slow part. It is
-idempotent — run it again to ship a new version. Then:
+The API runs as a **Lambda function** from a container image
+(`backend/Dockerfile.lambda`): the same FastAPI app, adapted to Lambda by
+[Mangum](https://github.com/Kludex/mangum) in `app/lambda_handler.py`. Requests
+reach it through its **function URL** (`https://<id>.lambda-url.<region>.on.aws`),
+Lambda's own public HTTPS endpoint, and that URL is the backend URL the frontend
+is built with. FastAPI keeps doing the routing, CORS and error envelope exactly
+as it does locally. `backend/Dockerfile` stays the local/compose image.
+
+The database is an **Aurora Serverless v2** PostgreSQL cluster with one
+`db.serverless` writer at the smallest size Aurora allows: it scales between
+0 and 1 ACU (`DbMinCapacity`, `DbMaxCapacity`) and **pauses after 5 idle
+minutes** (also the minimum), so an unused deployment
+pays only for storage. The first connection after a pause waits ~15 s while it
+resumes; the function's 60 s timeout covers that.
+
+The function sits in the account's **default VPC**, next to the cluster, so the
+database is never public: its security group only accepts the function's. The
+function needs nothing else on the network, so there is no NAT gateway.
+
+Migrations run in the same function: invoked directly with
+`{"action": "migrate"}` it applies them instead of serving a request. Function
+URL events never carry that key, so no web request can trigger it.
+`make aws-deploy-backend` invokes it after every deploy, so migrations run once
+per deploy rather than racing on each cold start.
+
+The first deploy takes ~15 minutes; Aurora is the slow part. It is idempotent —
+run it again to ship a new version. The image is passed to the stack by digest,
+not by tag, so every push really does update the function. If the stack is
+still busy with an earlier update, the target waits for it rather than failing.
 
 | Command | What it does |
 |---------|--------------|
 | `make aws-url` | Print the API URL (`/docs` for Swagger, `/health` for the check) |
-| `make aws-status` | Stack outputs plus desired/running task counts |
-| `make aws-logs` | Follow the task logs from CloudWatch |
-| `make aws-redeploy` | Push a new image and restart the tasks on it |
-| `make aws-stop` / `aws-start` | Scale the service to 0 / 1 task |
+| `make aws-status` | Stack outputs plus the API function's state |
+| `make aws-logs` | Follow the function logs from CloudWatch |
+| `make aws-migrate` | Apply migrations again on their own |
 | `make aws-destroy` | Delete every stack (asks first — the database goes too) |
 
-### HTTPS on a custom domain
+The image is built for `AWS_LAMBDA_ARCH` (`x86_64` by default).
+`AWS_LAMBDA_ARCH=arm64 make aws-deploy-backend` is ~20% cheaper and builds
+natively on Apple Silicon. The image platform follows this variable, so the two
+cannot drift apart. The build passes `--provenance=false` because Lambda rejects
+the multi-manifest image index that BuildKit otherwise pushes.
 
-Set `AWS_DOMAIN` in `.env` (e.g. `api.example.com`), then:
-
-```bash
-make aws-cert             # request the ACM certificate and see it validated
-make aws-deploy-backend   # add the HTTPS listener and serve the domain
-```
-
-`make aws-cert` reuses an already-issued certificate for the domain, resumes a
-pending request rather than piling up new ones, and validates over DNS. If
-Route 53 serves the domain **in this account**, it writes the validation record
-itself and the deploy also creates the alias record pointing at the ALB.
-Otherwise it prints the CNAME to add at your DNS provider and waits — interrupt
-it and re-run `make aws-cert` whenever you like, the request survives. With the
-DNS elsewhere, point the domain at the ALB yourself once the stack is up:
+### 2. Frontend — S3 + CloudFront
 
 ```bash
-make aws-status   # LoadBalancerDomain is the CNAME target
-```
-
-The certificate must live in the same region as the ALB, which `AWS_REGION`
-already takes care of. Once it is attached, port 80 stops serving the API and
-returns a 301 to HTTPS, the listener runs `ELBSecurityPolicy-TLS13-1-2-2021-06`,
-and `make aws-url` prints the `https://` URL. Add the domain to
-`AWS_CORS_ORIGINS` if the frontend calls it from a browser.
-
-Both stay optional: with `AWS_DOMAIN` empty the stack serves HTTP on the ALB's
-own name, exactly as before. Clearing `AWS_DOMAIN` after a deploy leaves the
-existing listener in place — `make aws-deploy-backend CertificateArn= DomainName=`
-is not a thing, so detach it by redeploying through CloudFormation with the
-parameters emptied, or delete the 443 listener in the console.
-
-Migrations run on container start (`RUN_MIGRATIONS_ON_START=true`), so a deploy
-applies them automatically.
-
-### Frontend — S3 and CloudFront
-
-The backend has to exist first: the distribution needs its load balancer as an
-origin.
-
-```bash
-make aws-deploy-frontend   # create/update the stack, build, upload, invalidate
+make aws-deploy-frontend   # create/update the stack, build against the API URL, upload
 make aws-frontend-url      # print the site URL
 ```
 
-One command does the lot: it deploys the stack, builds the Next.js **static
-export** in Docker with `NEXT_PUBLIC_API_BASE_URL` pointed at the site's own URL,
-uploads it to a private S3 bucket, and invalidates the CloudFront cache. Only
-CloudFront can read the bucket (origin access control); nothing in S3 is public.
+The target refuses to run until the backend stack exists. It reads the
+backend's function URL from that stack, builds the Next.js **static export** in
+Docker with `NEXT_PUBLIC_API_BASE_URL` set to it, syncs the files to a
+**private S3 bucket** and invalidates the **CloudFront** distribution in front
+of it. The site is served over HTTPS at `https://<id>.cloudfront.net`. A new
+distribution takes ~5 minutes to come up.
 
-Two details worth knowing:
+- The distribution is on CloudFront's **flat-rate Free plan**
+  (`AWS::PricingPlanManager::Subscription`): $0 a month for 1M requests and
+  100 GB, with no overage charges, WAF and DDoS protection included. The plan
+  requires a web ACL of its own, so the stack creates one that allows
+  everything. AWS allows 3 Free plans per account and refuses them while the
+  account is on the AWS Free Tier; set `AWS_CLOUDFRONT_PLAN=PAY_AS_YOU_GO` there.
+  `PricingPlanStatus` in the stack outputs reads `ACTIVE` once it applies.
+- The bucket blocks all public access. CloudFront reads it through **origin
+  access control**, and the bucket policy admits only this distribution.
+- The export is built with `trailingSlash`, so each route is a folder with an
+  `index.html` (`/meetings/new/`). A small CloudFront Function maps clean URLs
+  onto those files, since S3's REST endpoint has no index documents. Anything
+  missing gets the export's `404.html` with a 404 status.
+  `output` stays `standalone` for the compose/production image and switches to
+  `export` only when `NEXT_OUTPUT=export` is set, which is the deploy target's
+  job.
+- HTML is uploaded with `no-cache` and the hashed assets with a one-year
+  immutable header, and every deploy invalidates `/*`, so a new version shows up
+  on the next page load.
+- With `AWS_CORS_ORIGINS` empty, the backend allows exactly the frontend's
+  origins (the CloudFront URL and the custom domain). On the very first
+  `make aws-deploy` the frontend does not exist yet, so the API starts with `*`;
+  the frontend step says so, and the next `make aws-deploy-backend` locks it down.
 
-- `next build` writes `/meetings/new.html`, but the browser asks for
-  `/meetings/new`. A CloudFront Function rewrites the path at the edge, so
-  clean URLs work without a server.
-- Static assets are uploaded with a one-year immutable cache header and the HTML
-  with `no-cache`, so a deploy is visible immediately while `/_next/*` stays
-  cached. The build is a separate stage in `frontend/Dockerfile`; `output` stays
-  `standalone` for the compose/production image and switches to `export` only
-  when `NEXT_OUTPUT=export` is set, which is the deploy target's job.
+### 3. Custom domain for the frontend (optional)
 
-For a custom domain, set `AWS_FRONTEND_DOMAIN` in `.env` and run
-`make aws-frontend-cert` before deploying. CloudFront only accepts certificates
-from **us-east-1**, so that target requests it there regardless of `AWS_REGION`.
-Point the domain at the `DistributionDomain` from `make aws-status`.
+```bash
+# .env
+AWS_FRONTEND_DOMAIN=app.example.com
 
-If the backend has its own certificate, CloudFront switches its API origin to
-`https://$AWS_DOMAIN` automatically — with a certificate attached, the ALB's port
-80 redirects, so an HTTP origin would bounce the browser off to the ALB's name.
+make aws-frontend-cert      # request + DNS-validate the certificate in us-east-1
+make aws-deploy-frontend    # attach the domain to the distribution
+make aws-deploy-backend     # add the new origin to the API's CORS
+```
+
+CloudFront only reads ACM certificates from **us-east-1**, and that is where
+everything is deployed. `make aws-frontend-cert` (`infra/certificate.sh`) reuses
+an issued or pending certificate for the domain, or requests one, then waits for
+DNS validation. If the domain's Route 53 hosted zone is in this account, it
+writes the validation record itself, and the frontend stack adds the A/AAAA
+alias records pointing at the distribution. Otherwise both print the records
+to add at your DNS provider: the validation CNAME, then a CNAME from the domain
+to the distribution's `*.cloudfront.net` name.
+
+The API keeps its function URL: a function URL cannot take a custom domain.
 
 ### Cost
 
-The ALB (750 h/month), RDS `db.t3.micro` (750 h + 20 GB) and ECR (500 MB) fit in
-the 12-month free tier. **Fargate has no free tier**: the smallest task
-(0.25 vCPU / 0.5 GB) runs about **$10/month** in `eu-central-1` if it stays up
-around the clock. Two ways to cut that:
-
-- `make aws-stop` between demos — it scales the service to zero tasks, and the
-  ALB and database keep the URL and the data. `make aws-start` brings it back.
-- `AWS_TASK_ARCH=ARM64 make aws-deploy-backend` — Graviton is ~20% cheaper and builds
-  natively on Apple Silicon. The image platform follows this variable, so the
-  two cannot drift apart.
+- **Lambda** — 1M requests and 400,000 GB-seconds a month, always free. The
+  function URL costs nothing beyond the invocation.
+- **Aurora Serverless v2** is not in the free tier. It bills per ACU-hour while
+  awake, nothing for compute while paused, plus storage and I/O. A demo that
+  sits idle costs cents a month.
+- **CloudFront** — the flat-rate Free plan: $0, 1M requests and 100 GB a month,
+  never an overage charge (traffic past it may be slowed, not billed).
+  **S3** — 5 GB and 20,000 GETs in the free tier; CloudFront caches most reads.
+  ACM certificates are free.
+- **ECR** — 500 MB in the free tier; the lifecycle policy keeps five images.
 
 `make aws-destroy` deletes everything, database included, with no snapshot left
 behind. Accounts opened after July 2025 get credits instead of the classic free
@@ -193,17 +222,24 @@ tier — check your billing console rather than assuming.
 
 ### Known trade-offs
 
-- The database password reaches the container as a plain environment variable in
-  the task definition. Moving it to SSM Parameter Store (free) is the first thing
-  to harden.
-- ACM certificates are free, so HTTPS adds nothing to the bill.
-- S3 (5 GB) and CloudFront (1 TB out, 10M requests/month, always free) cover a
-  site this size. Cache invalidations are free up to 1,000 paths a month; each
-  deploy spends one.
-- One task, one AZ for the database: a deploy has a few seconds of downtime and
-  there is no failover. That is the free-tier shape, not a production one.
-- A trailing slash on a route (`/meetings/new/`) lands on the 404 page. Next.js
-  generates links without one, so this only shows up if a URL is typed that way.
+- **No custom domain on the API**: function URLs cannot take one. Putting one on
+  it would need API Gateway or a second CloudFront distribution in front.
+- The database password reaches the function as a plain environment variable.
+  Moving it to SSM Parameter Store or Secrets Manager is the first thing to
+  harden.
+- **Cold starts**: the first request after a few idle minutes waits ~1–2 s while
+  Lambda starts the container, and up to ~15 s more if Aurora has paused.
+- Every warm instance holds one database connection. Nothing is reserved by
+  default (`MaxConcurrency=0`): new accounts have a Lambda concurrency limit of
+  10 in total and Lambda refuses to reserve any of it, so that limit is the cap,
+  well under the cluster's connection limit. Once the limit is raised, set
+  `MaxConcurrency` to keep a spike off the database; requests beyond it get
+  HTTP 429. RDS Proxy is the proper fix, and it is not free.
+- The function URL is public, like the local API: there is no authentication
+  and no request throttling in front of it beyond the concurrency limit.
+- Deleting the backend stack takes ~20 minutes: Lambda releases its VPC network
+  interfaces slowly, and the security groups wait for them.
+- One Aurora instance: there is no reader to fail over to.
 
 ## API
 
@@ -236,7 +272,7 @@ sent, so every client shows the same time as the day it was listed under.
 ```
 backend/    FastAPI app (api → services → repositories → models), Alembic, tests
 frontend/   Next.js app, shadcn/ui primitives in components/ui
-infra/      CloudFormation templates + the ACM script behind the aws-* targets
+infra/      CloudFormation templates behind the aws-* targets
 docker-compose.yml
 ```
 

@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: Container registry for the meetings backend image.
+Description: Container registry for the meetings backend image (run by Lambda).
 
 Parameters:
   ProjectName:
@@ -14,6 +14,23 @@ Resources:
       RepositoryName: !Sub "${ProjectName}-backend"
       # Lets `make aws-destroy` delete the repository without emptying it first.
       EmptyOnDelete: true
+      # Lambda pulls the image itself when a function is created or updated.
+      RepositoryPolicyText:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: LambdaECRImageRetrievalPolicy
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - ecr:BatchGetImage
+              - ecr:GetDownloadUrlForLayer
+            Condition:
+              StringLike:
+                aws:sourceArn: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:*"
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
       ImageScanningConfiguration:
         ScanOnPush: true
       # The free tier gives 500 MB of storage, so keep only recent images.
