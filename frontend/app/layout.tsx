@@ -26,7 +26,8 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       lang="en"
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
-      <body className="min-h-full flex flex-col">
+      {/* Extensions such as Grammarly add attributes to <body> before React hydrates. */}
+      <body className="min-h-full flex flex-col" suppressHydrationWarning>
         <Providers>{children}</Providers>
         <Toaster richColors position="bottom-right" />
       </body>
