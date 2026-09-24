@@ -62,6 +62,18 @@ async def create_meeting(
     return MeetingRead.model_validate(meeting)
 
 
+@router.put(
+    "/{meeting_id}",
+    response_model=MeetingRead,
+    summary="Replace a meeting's details and participants",
+    responses={404: {"description": "Meeting not found"}, 422: {"description": "Validation error"}},
+)
+async def update_meeting(
+    meeting_id: uuid.UUID, payload: MeetingCreate, service: MeetingServiceDep
+) -> MeetingRead:
+    return MeetingRead.model_validate(await service.update(meeting_id, payload))
+
+
 @router.delete(
     "/{meeting_id}",
     status_code=status.HTTP_204_NO_CONTENT,

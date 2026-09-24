@@ -78,6 +78,43 @@ async def test_delete_removes_meeting_and_participants(client, session, meeting_
     assert remaining == 0
 
 
+async def test_update_replaces_fields_and_participants(client, meeting_payload):
+    created = (await client.post("/api/v1/meetings", json=meeting_payload)).json()
+    meeting_payload["name"] = "Sprint review"
+    meeting_payload["location"] = "  "
+    meeting_payload["participants"] = [{"name": "Iryna"}, {"name": "Taras"}]
+
+    response = await client.put(f"/api/v1/meetings/{created['id']}", json=meeting_payload)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["id"] == created["id"]
+    assert body["name"] == "Sprint review"
+    assert body["location"] is None
+    assert [(p["name"], p["position"]) for p in body["participants"]] == [
+        ("Iryna", 0),
+        ("Taras", 1),
+    ]
+    fetched = (await client.get(f"/api/v1/meetings/{created['id']}")).json()
+    assert [p["name"] for p in fetched["participants"]] == ["Iryna", "Taras"]
+
+
+async def test_update_unknown_meeting_returns_404(client, meeting_payload):
+    response = await client.put(f"/api/v1/meetings/{uuid.uuid4()}", json=meeting_payload)
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "not_found"
+
+
+async def test_update_rejects_end_before_start(client, meeting_payload):
+    created = (await client.post("/api/v1/meetings", json=meeting_payload)).json()
+    meeting_payload["ends_at"] = meeting_payload["starts_at"]
+
+    response = await client.put(f"/api/v1/meetings/{created['id']}", json=meeting_payload)
+
+    assert response.status_code == 422
+
+
 async def test_health_reports_database_ok(client):
     response = await client.get("/health")
 

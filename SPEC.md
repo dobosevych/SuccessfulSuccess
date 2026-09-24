@@ -29,7 +29,6 @@ The whole system (frontend, backend, database) starts with a single
 - Authentication / user accounts / authorization.
 - Recurring meetings, invitations, notifications, e-mail.
 - Calendar integrations (Google/Outlook), timezone selection per user.
-- Editing meetings (delete ships in v1; edit is deferred to v2).
 - Real-time updates (WebSockets) — the list refreshes on navigation/mutation.
 
 ---
@@ -315,6 +314,11 @@ Request body:
 - `201 Created`, body = full `MeetingRead`, header `Location: /api/v1/meetings/{id}`.
 - `422` on validation failure (see error format below).
 
+#### `PUT /api/v1/meetings/{id}`
+Same body and validation as `POST`; replaces every field and the whole participant list.
+- `200 OK`, body = full `MeetingRead` with a new `updated_at`.
+- `404` if missing, `422` on validation failure.
+
 #### `DELETE /api/v1/meetings/{id}` *(v1, minimal)*
 `204 No Content`; `404` if missing. Cascades to participants.
 
@@ -360,6 +364,7 @@ has a `summary`, `response_model`, and documented error responses.
 7. `GET /meetings/{unknown}` → `404` in the standard error shape.
 8. `DELETE` removes the meeting and its participants.
 9. `GET /health` → `200` with `database: "ok"`.
+10. `PUT /meetings/{id}` replaces fields and participants; unknown id → `404`; invalid body → `422`.
 
 Tests run against a real Postgres (a `db-test` service or the same instance with a
 separate database), each test in a rolled-back transaction.

@@ -2,7 +2,7 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 
-import { createMeeting, deleteMeeting, listMeetings } from "@/lib/api"
+import { createMeeting, deleteMeeting, listMeetings, updateMeeting } from "@/lib/api"
 import type { MeetingCreateInput } from "@/lib/types"
 
 /** Shared cache key: the list and the header menu read the same entry. */
@@ -19,6 +19,15 @@ export function useCreateMeeting() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (payload: MeetingCreateInput) => createMeeting(payload),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["meetings"] }),
+  })
+}
+
+export function useUpdateMeeting() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, payload }: { id: string; payload: MeetingCreateInput }) =>
+      updateMeeting(id, payload),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["meetings"] }),
   })
 }

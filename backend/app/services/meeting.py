@@ -1,4 +1,4 @@
-"""Business rules for meetings: the day window and the create/list/delete use cases."""
+"""Business rules for meetings: the day window and the create/list/update/delete use cases."""
 
 import uuid
 from datetime import date, datetime, time, timedelta
@@ -55,6 +55,10 @@ class MeetingService:
 
     async def create(self, payload: MeetingCreate) -> Meeting:
         return await self.repo.create(payload)
+
+    async def update(self, meeting_id: uuid.UUID, payload: MeetingCreate) -> Meeting:
+        meeting = await self.get(meeting_id)
+        return await self.repo.update(meeting, payload)
 
     async def delete(self, meeting_id: uuid.UUID) -> None:
         if not await self.repo.delete(meeting_id):

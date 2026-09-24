@@ -2,7 +2,7 @@
 
 import { zodResolver } from "@hookform/resolvers/zod"
 import { CalendarIcon } from "lucide-react"
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { Controller, useForm } from "react-hook-form"
 import { toast } from "sonner"
 import { z } from "zod"
@@ -22,9 +22,10 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { Textarea } from "@/components/ui/textarea"
-import { useCreateMeeting } from "@/hooks/use-meetings"
+import { useCreateMeeting, useUpdateMeeting } from "@/hooks/use-meetings"
 import { ApiError } from "@/lib/api"
-import { toIsoDate, toIsoWithOffset } from "@/lib/datetime"
+import { formatTime, parseIsoDay, toIsoDate, toIsoWithOffset } from "@/lib/datetime"
+import type { Meeting } from "@/lib/types"
 
 const timePattern = /^([01]\d|2[0-3]):([0-5]\d)$/
 
@@ -81,19 +82,10 @@ function participantErrors(
   )
 }
 
-export function CreateMeetingDialog({
-  open,
-  onOpenChange,
-}: {
-  open: boolean
-  onOpenChange: (open: boolean) => void
-}) {
-  const createMeeting = useCreateMeeting()
-  const [datePickerOpen, setDatePickerOpen] = useState(false)
-
-  const form = useForm<FormValues>({
-    resolver: zodResolver(formSchema),
-    defaultValues: {
+/** Blank form for a new meeting, or the meeting's current values when editing. */
+function defaultValues(meeting?: Meeting): FormValues {
+  if (!meeting) {
+    return {
       name: "",
       description: "",
       location: "",
@@ -101,7 +93,40 @@ export function CreateMeetingDialog({
       startTime: "10:00",
       endTime: "11:00",
       participants: [{ name: "", email: "" }],
-    },
+    }
+  }
+  return {
+    name: meeting.name,
+    description: meeting.description ?? "",
+    location: meeting.location ?? "",
+    date: parseIsoDay(meeting.starts_at),
+    startTime: formatTime(meeting.starts_at),
+    endTime: formatTime(meeting.ends_at),
+    participants:
+      meeting.participants.length > 0
+        ? meeting.participants.map((p) => ({ name: p.name, email: p.email ?? "" }))
+        : [{ name: "", email: "" }],
+  }
+}
+
+/** Creates a meeting, or edits `meeting` when one is passed. */
+export function MeetingFormDialog({
+  open,
+  onOpenChange,
+  meeting,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  meeting?: Meeting
+}) {
+  const createMeeting = useCreateMeeting()
+  const updateMeeting = useUpdateMeeting()
+  const [datePickerOpen, setDatePickerOpen] = useState(false)
+  const isEdit = !!meeting
+
+  const form = useForm<FormValues>({
+    resolver: zodResolver(formSchema),
+    defaultValues: defaultValues(meeting),
   })
 
   const {
@@ -113,6 +138,11 @@ export function CreateMeetingDialog({
     formState: { errors, isSubmitting },
   } = form
 
+  // Refill the form each time it opens, so edits start from the meeting's current values.
+  useEffect(() => {
+    if (open) reset(defaultValues(meeting))
+  }, [open, meeting, reset])
+
   const onSubmit = handleSubmit(async (values) => {
     const participants = values.participants
       .filter((participant) => participant.name.trim() !== "")
@@ -121,17 +151,23 @@ export function CreateMeetingDialog({
         email: participant.email?.trim() ? participant.email.trim() : null,
       }))
 
+    const payload = {
+      name: values.name.trim(),
+      description: values.description?.trim() || null,
+      location: values.location?.trim() || null,
+      starts_at: toIsoWithOffset(values.date, values.startTime),
+      ends_at: toIsoWithOffset(values.date, values.endTime),
+      participants,
+    }
+
     try {
-      await createMeeting.mutateAsync({
-        name: values.name.trim(),
-        description: values.description?.trim() || null,
-        location: values.location?.trim() || null,
-        starts_at: toIsoWithOffset(values.date, values.startTime),
-        ends_at: toIsoWithOffset(values.date, values.endTime),
-        participants,
-      })
-      toast.success("Meeting created")
-      reset()
+      if (meeting) {
+        await updateMeeting.mutateAsync({ id: meeting.id, payload })
+        toast.success("Meeting updated")
+      } else {
+        await createMeeting.mutateAsync(payload)
+        toast.success("Meeting created")
+      }
       onOpenChange(false)
     } catch (error) {
       if (error instanceof ApiError) {
@@ -150,7 +186,7 @@ export function CreateMeetingDialog({
         }
         toast.error(error.message)
       } else {
-        toast.error("Could not create the meeting.")
+        toast.error(isEdit ? "Could not update the meeting." : "Could not create the meeting.")
       }
     }
   })
@@ -159,9 +195,11 @@ export function CreateMeetingDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[90svh] overflow-y-auto sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>New meeting</DialogTitle>
+          <DialogTitle>{isEdit ? "Edit meeting" : "New meeting"}</DialogTitle>
           <DialogDescription>
-            Give it a name, a time slot and the people who should be there.
+            {isEdit
+              ? "Change the details, time slot or participants."
+              : "Give it a name, a time slot and the people who should be there."}
           </DialogDescription>
         </DialogHeader>
 
@@ -271,7 +309,13 @@ export function CreateMeetingDialog({
               Cancel
             </Button>
             <Button type="submit" disabled={isSubmitting}>
-              {isSubmitting ? "Creating…" : "Create meeting"}
+              {isEdit
+                ? isSubmitting
+                  ? "Saving…"
+                  : "Save changes"
+                : isSubmitting
+                  ? "Creating…"
+                  : "Create meeting"}
             </Button>
           </DialogFooter>
         </form>

@@ -61,6 +61,21 @@ class MeetingRepository:
         await self.session.refresh(meeting)
         return meeting
 
+    async def update(self, meeting: Meeting, payload: MeetingCreate) -> Meeting:
+        """Replace every field and the whole participant list (delete-orphan drops the old rows)."""
+        meeting.name = payload.name
+        meeting.description = payload.description
+        meeting.location = payload.location
+        meeting.starts_at = payload.starts_at
+        meeting.ends_at = payload.ends_at
+        meeting.participants = [
+            Participant(name=p.name, email=p.email, position=index)
+            for index, p in enumerate(payload.participants)
+        ]
+        await self.session.commit()
+        await self.session.refresh(meeting)
+        return meeting
+
     async def delete(self, meeting_id: uuid.UUID) -> bool:
         result = await self.session.execute(delete(Meeting).where(Meeting.id == meeting_id))
         await self.session.commit()

@@ -74,6 +74,13 @@ export function createMeeting(payload: MeetingCreateInput) {
   })
 }
 
+export function updateMeeting(id: string, payload: MeetingCreateInput) {
+  return request<Meeting>(`/api/v1/meetings/${id}`, {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  })
+}
+
 export function deleteMeeting(id: string) {
   return request<void>(`/api/v1/meetings/${id}`, { method: "DELETE" })
 }

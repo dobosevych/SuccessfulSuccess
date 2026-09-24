@@ -4,7 +4,7 @@ export const metadata = {
   title: "New meeting — SuccessfulSuccess",
 };
 
-/** Same screen as "/", with the create dialog already open. */
+/** Same screen as "/today", with the create dialog already open. */
 export default function NewMeetingPage() {
   return <TodayPage initialDialogOpen />;
 }
