@@ -1,7 +1,6 @@
 """FastAPI application factory."""
 
 import logging
-from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,21 +15,11 @@ logging.basicConfig(level=settings.log_level.upper())
 logger = logging.getLogger("meetings")
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    if settings.seed_demo_data:
-        from app.seed import seed_if_empty
-
-        await seed_if_empty()
-    yield
-
-
 def create_app() -> FastAPI:
     app = FastAPI(
         title="SuccessfulSuccess Meetings API",
         version=settings.version,
-        summary="Meetings for today: list them, create them, delete them.",
-        lifespan=lifespan,
+        summary="Each signed-in user's meetings for today: list, create, edit, delete.",
     )
 
     app.add_middleware(

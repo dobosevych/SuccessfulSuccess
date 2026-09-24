@@ -53,3 +53,17 @@ export type ApiErrorBody = {
     details: ApiErrorDetail[]
   }
 }
+
+export type UserProfile = {
+  id: string
+  email: string | null
+  email_verified: boolean
+  name: string | null
+  given_name: string | null
+  family_name: string | null
+  picture_url: string | null
+  auth_provider: string
+  created_at: string
+  updated_at: string
+  last_login_at: string | null
+}

@@ -1,7 +1,11 @@
-"""Insert a few demo meetings for today when the database is still empty."""
+"""Insert a few demo meetings for today for one user who has none yet.
+
+Usage: python -m app.seed <cognito-sub>
+"""
 
 import asyncio
 import logging
+import sys
 from datetime import datetime, time
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -10,6 +14,7 @@ from app.config import settings
 from app.db import SessionFactory
 from app.models import Meeting, Participant
 from app.repositories.meeting import MeetingRepository
+from app.repositories.user import UserRepository
 
 logger = logging.getLogger("meetings.seed")
 
@@ -41,16 +46,20 @@ DEMO = [
 ]
 
 
-async def seed_if_empty(session_factory: async_sessionmaker = SessionFactory) -> None:
+async def seed_if_empty(
+    owner_id: str, session_factory: async_sessionmaker = SessionFactory
+) -> None:
     async with session_factory() as session:
-        if await MeetingRepository(session).count():
-            logger.info("Database already has meetings; skipping demo seed.")
+        if await MeetingRepository(session, owner_id).count():
+            logger.info("User %s already has meetings; skipping demo seed.", owner_id)
             return
 
+        await UserRepository(session).ensure(owner_id)
         today = datetime.now(settings.tz).date()
         for name, description, location, start, end, people in DEMO:
             session.add(
                 Meeting(
+                    owner_id=owner_id,
                     name=name,
                     description=description,
                     location=location,
@@ -63,8 +72,11 @@ async def seed_if_empty(session_factory: async_sessionmaker = SessionFactory) ->
                 )
             )
         await session.commit()
-        logger.info("Seeded %d demo meetings for %s.", len(DEMO), today)
+        logger.info("Seeded %d demo meetings for %s on %s.", len(DEMO), owner_id, today)
 
 
 if __name__ == "__main__":
-    asyncio.run(seed_if_empty())
+    if len(sys.argv) != 2:
+        sys.exit("Usage: python -m app.seed <cognito-sub>")
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(seed_if_empty(sys.argv[1]))

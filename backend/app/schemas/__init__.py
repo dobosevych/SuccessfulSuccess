@@ -4,6 +4,8 @@ from app.schemas.meeting import (
     MeetingRead,
     ParticipantCreate,
     ParticipantRead,
+    UserRead,
+    UserSync,
 )
 
 __all__ = [
@@ -12,4 +14,6 @@ __all__ = [
     "MeetingRead",
     "ParticipantCreate",
     "ParticipantRead",
+    "UserRead",
+    "UserSync",
 ]

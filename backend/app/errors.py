@@ -1,5 +1,6 @@
 """A single error envelope for every non-2xx response."""
 
+import logging
 from typing import Any
 
 from fastapi import FastAPI, Request, status
@@ -7,11 +8,15 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.auth import AuthError, AuthNotConfiguredError
 from app.services.meeting import MeetingNotFoundError
 
 HTTP_422_UNPROCESSABLE = 422
 
+logger = logging.getLogger("meetings.errors")
+
 _STATUS_CODES = {
+    status.HTTP_401_UNAUTHORIZED: "unauthorized",
     status.HTTP_404_NOT_FOUND: "not_found",
     HTTP_422_UNPROCESSABLE: "validation_error",
     status.HTTP_503_SERVICE_UNAVAILABLE: "service_unavailable",
@@ -48,6 +53,19 @@ def _field_path(location: tuple[Any, ...]) -> str:
 
 
 def register_exception_handlers(app: FastAPI) -> None:
+    @app.exception_handler(AuthError)
+    async def _unauthorized(_: Request, exc: AuthError) -> JSONResponse:
+        response = error_response(status.HTTP_401_UNAUTHORIZED, str(exc))
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+
+    @app.exception_handler(AuthNotConfiguredError)
+    async def _auth_not_configured(_: Request, exc: AuthNotConfiguredError) -> JSONResponse:
+        logger.error("COGNITO_USER_POOL_ID / COGNITO_CLIENT_ID are not set; refusing requests.")
+        return error_response(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "Sign-in is not configured on the server."
+        )
+
     @app.exception_handler(MeetingNotFoundError)
     async def _not_found(_: Request, exc: MeetingNotFoundError) -> JSONResponse:
         return error_response(status.HTTP_404_NOT_FOUND, str(exc))

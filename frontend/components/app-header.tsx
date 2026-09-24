@@ -14,6 +14,7 @@ import {
 } from "@/components/ui/navigation-menu"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { SiteHeader } from "@/components/site-header"
+import { UserMenu } from "@/components/user-menu"
 import { useMeetings } from "@/hooks/use-meetings"
 import { formatTimeRange } from "@/lib/datetime"
 
@@ -72,6 +73,7 @@ export function AppHeader({ onCreate }: { onCreate: () => void }) {
         <Plus className="size-4" aria-hidden />
         <span className="hidden sm:inline">New meeting</span>
       </Button>
+      <UserMenu />
     </SiteHeader>
   )
 }

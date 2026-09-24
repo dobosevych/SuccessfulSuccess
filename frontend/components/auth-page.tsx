@@ -1,26 +1,108 @@
 "use client"
 
 import { zodResolver } from "@hookform/resolvers/zod"
-import { Eye, EyeOff, Sparkles, Users, Clock } from "lucide-react"
-import { useState } from "react"
+import {
+  confirmResetPassword,
+  confirmSignUp,
+  resendSignUpCode,
+  resetPassword,
+  signIn,
+  signInWithRedirect,
+  signUp,
+} from "aws-amplify/auth"
+import { AlertCircle, ArrowLeft, Clock, Eye, EyeOff, MailCheck, Sparkles, Users } from "lucide-react"
+import { useRouter } from "next/navigation"
+import { useEffect, useState } from "react"
 import { useForm } from "react-hook-form"
 import { toast } from "sonner"
 import { z } from "zod"
 
+import { useAuth } from "@/components/auth-provider"
+import { AuthLoading } from "@/components/require-auth"
 import { SiteHeader } from "@/components/site-header"
 import { Button } from "@/components/ui/button"
 import { FieldSeparator } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { authConfig, authErrorMessage, configureAuth, isAuthConfigured } from "@/lib/auth"
 
-type Mode = "login" | "signup"
+/** Which card the page shows. `email` carries over between steps. */
+type Step =
+  | { kind: "signIn" }
+  | { kind: "signUp" }
+  | { kind: "confirmSignUp"; email: string; password: string; destination?: string }
+  | { kind: "forgotPassword" }
+  | { kind: "resetPassword"; email: string; destination?: string }
 
-const formSchema = z.object({
-  email: z.email("Enter a valid email address"),
-  password: z.string().min(8, "Use at least 8 characters"),
-})
+const email = z.email("Enter a valid email address")
 
-type FormValues = z.infer<typeof formSchema>
+// Mirrors the user pool's password policy in infra/auth.yml.
+const newPassword = z
+  .string()
+  .min(8, "Use at least 8 characters")
+  .regex(/[a-z]/, "Add a lowercase letter")
+  .regex(/[A-Z]/, "Add an uppercase letter")
+  .regex(/[0-9]/, "Add a number")
+
+const code = z.string().trim().regex(/^\d{6}$/, "Enter the 6-digit code from the email")
+
+const signInSchema = z.object({ email, password: z.string().min(1, "Enter your password") })
+const signUpSchema = z.object({ email, password: newPassword })
+const confirmSchema = z.object({ code })
+const forgotSchema = z.object({ email })
+const resetSchema = z.object({ code, password: newPassword })
+
+function FieldError({ id, message }: { id: string; message?: string }) {
+  return message ? (
+    <p id={id} className="text-destructive text-sm">
+      {message}
+    </p>
+  ) : null
+}
+
+function FormError({ message }: { message: string | null }) {
+  return message ? (
+    <div
+      role="alert"
+      className="bg-destructive/10 text-destructive flex items-start gap-2 rounded-2xl px-4 py-3 text-sm"
+    >
+      <AlertCircle className="mt-0.5 size-4 shrink-0" aria-hidden />
+      <span>{message}</span>
+    </div>
+  ) : null
+}
+
+function PasswordInput({
+  id,
+  autoComplete,
+  invalid,
+  ...props
+}: React.ComponentProps<"input"> & { invalid?: boolean }) {
+  const [visible, setVisible] = useState(false)
+  return (
+    <div className="relative">
+      <Input
+        id={id}
+        type={visible ? "text" : "password"}
+        autoComplete={autoComplete}
+        className="h-12 pr-12"
+        aria-invalid={invalid}
+        aria-describedby={invalid ? `${id}-error` : undefined}
+        {...props}
+      />
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        className="absolute top-1/2 right-2 -translate-y-1/2"
+        aria-label={visible ? "Hide password" : "Show password"}
+        onClick={() => setVisible((value) => !value)}
+      >
+        {visible ? <EyeOff /> : <Eye />}
+      </Button>
+    </div>
+  )
+}
 
 function GoogleIcon() {
   return (
@@ -81,27 +163,380 @@ function Showcase() {
   )
 }
 
-export function AuthPage() {
-  const [mode, setMode] = useState<Mode>("login")
-  const [showPassword, setShowPassword] = useState(false)
 
+function SignInForm({ onStep }: { onStep: (step: Step) => void }) {
+  const [error, setError] = useState<string | null>(null)
   const {
     register,
     handleSubmit,
     formState: { errors, isSubmitting },
-  } = useForm<FormValues>({ resolver: zodResolver(formSchema) })
+  } = useForm({ resolver: zodResolver(signInSchema) })
 
-  const isLogin = mode === "login"
+  const onSubmit = handleSubmit(async (values) => {
+    setError(null)
+    try {
+      const { nextStep } = await signIn({ username: values.email, password: values.password })
+      if (nextStep.signInStep === "CONFIRM_SIGN_UP") {
+        // Signed up earlier but never entered the code: send a fresh one.
+        const { destination } = await resendSignUpCode({ username: values.email })
+        onStep({ kind: "confirmSignUp", email: values.email, password: values.password, destination })
+      } else if (nextStep.signInStep !== "DONE") {
+        setError("This account needs a sign-in step the app does not support yet.")
+      }
+      // DONE: the auth provider hears about it and the page moves on to /today.
+    } catch (caught) {
+      setError(authErrorMessage(caught))
+    }
+  })
 
-  // Not wired to the backend yet: just acknowledge the attempt.
-  const onSubmit = (values: FormValues) => {
-    toast.info(
-      `${isLogin ? "Log in" : "Sign up"} as ${values.email} isn't connected yet.`,
-    )
+  return (
+    <form onSubmit={onSubmit} noValidate className="grid gap-4">
+      <FormError message={error} />
+      <div className="grid gap-2">
+        <Label htmlFor="email">Email</Label>
+        <Input
+          id="email"
+          type="email"
+          autoComplete="email"
+          placeholder="you@example.com"
+          className="h-12"
+          aria-invalid={!!errors.email}
+          aria-describedby={errors.email ? "email-error" : undefined}
+          {...register("email")}
+        />
+        <FieldError id="email-error" message={errors.email?.message} />
+      </div>
+
+      <div className="grid gap-2">
+        <div className="flex items-center justify-between">
+          <Label htmlFor="password">Password</Label>
+          <button
+            type="button"
+            className="text-primary text-sm font-medium hover:underline"
+            onClick={() => onStep({ kind: "forgotPassword" })}
+          >
+            Forgot password?
+          </button>
+        </div>
+        <PasswordInput
+          id="password"
+          autoComplete="current-password"
+          placeholder="Your password"
+          invalid={!!errors.password}
+          {...register("password")}
+        />
+        <FieldError id="password-error" message={errors.password?.message} />
+      </div>
+
+      <Button type="submit" disabled={isSubmitting} className="mt-2 h-12 w-full text-[0.95rem]">
+        {isSubmitting ? "Logging in…" : "Log in"}
+      </Button>
+    </form>
+  )
+}
+
+function SignUpForm({ onStep }: { onStep: (step: Step) => void }) {
+  const [error, setError] = useState<string | null>(null)
+  const {
+    register,
+    handleSubmit,
+    formState: { errors, isSubmitting },
+  } = useForm({ resolver: zodResolver(signUpSchema) })
+
+  const onSubmit = handleSubmit(async (values) => {
+    setError(null)
+    try {
+      const { nextStep } = await signUp({
+        username: values.email,
+        password: values.password,
+        options: { userAttributes: { email: values.email } },
+      })
+      if (nextStep.signUpStep === "CONFIRM_SIGN_UP") {
+        onStep({
+          kind: "confirmSignUp",
+          email: values.email,
+          password: values.password,
+          destination: nextStep.codeDeliveryDetails.destination,
+        })
+      } else {
+        await signIn({ username: values.email, password: values.password })
+      }
+    } catch (caught) {
+      setError(authErrorMessage(caught))
+    }
+  })
+
+  return (
+    <form onSubmit={onSubmit} noValidate className="grid gap-4">
+      <FormError message={error} />
+      <div className="grid gap-2">
+        <Label htmlFor="email">Email</Label>
+        <Input
+          id="email"
+          type="email"
+          autoComplete="email"
+          placeholder="you@example.com"
+          className="h-12"
+          aria-invalid={!!errors.email}
+          aria-describedby={errors.email ? "email-error" : undefined}
+          {...register("email")}
+        />
+        <FieldError id="email-error" message={errors.email?.message} />
+      </div>
+
+      <div className="grid gap-2">
+        <Label htmlFor="password">Password</Label>
+        <PasswordInput
+          id="password"
+          autoComplete="new-password"
+          placeholder="8+ characters, upper & lower case, a number"
+          invalid={!!errors.password}
+          {...register("password")}
+        />
+        <FieldError id="password-error" message={errors.password?.message} />
+      </div>
+
+      <Button type="submit" disabled={isSubmitting} className="mt-2 h-12 w-full text-[0.95rem]">
+        {isSubmitting ? "Creating account…" : "Sign up"}
+      </Button>
+    </form>
+  )
+}
+
+function CodeInput({ invalid, ...props }: React.ComponentProps<"input"> & { invalid?: boolean }) {
+  return (
+    <Input
+      id="code"
+      inputMode="numeric"
+      autoComplete="one-time-code"
+      placeholder="123456"
+      maxLength={6}
+      className="h-12 text-center font-mono text-lg tracking-[0.5em]"
+      aria-invalid={invalid}
+      aria-describedby={invalid ? "code-error" : undefined}
+      {...props}
+    />
+  )
+}
+
+function ConfirmSignUpForm({ step }: { step: Extract<Step, { kind: "confirmSignUp" }> }) {
+  const [error, setError] = useState<string | null>(null)
+  const {
+    register,
+    handleSubmit,
+    formState: { errors, isSubmitting },
+  } = useForm({ resolver: zodResolver(confirmSchema) })
+
+  const onSubmit = handleSubmit(async (values) => {
+    setError(null)
+    try {
+      await confirmSignUp({ username: step.email, confirmationCode: values.code })
+      await signIn({ username: step.email, password: step.password })
+    } catch (caught) {
+      setError(authErrorMessage(caught))
+    }
+  })
+
+  const onResend = async () => {
+    try {
+      await resendSignUpCode({ username: step.email })
+      toast.success("We sent you a new code.")
+    } catch (caught) {
+      setError(authErrorMessage(caught))
+    }
   }
 
-  const onGoogle = () => {
-    toast.info("Google sign-in isn't connected yet.")
+  return (
+    <form onSubmit={onSubmit} noValidate className="grid gap-4">
+      <FormError message={error} />
+      <div className="grid gap-2">
+        <Label htmlFor="code">Verification code</Label>
+        <CodeInput invalid={!!errors.code} {...register("code")} />
+        <FieldError id="code-error" message={errors.code?.message} />
+      </div>
+      <Button type="submit" disabled={isSubmitting} className="mt-2 h-12 w-full text-[0.95rem]">
+        {isSubmitting ? "Verifying…" : "Verify and continue"}
+      </Button>
+      <button
+        type="button"
+        className="text-primary text-sm font-medium hover:underline"
+        onClick={onResend}
+      >
+        Resend the code
+      </button>
+    </form>
+  )
+}
+
+function ForgotPasswordForm({ onStep }: { onStep: (step: Step) => void }) {
+  const [error, setError] = useState<string | null>(null)
+  const {
+    register,
+    handleSubmit,
+    formState: { errors, isSubmitting },
+  } = useForm({ resolver: zodResolver(forgotSchema) })
+
+  const onSubmit = handleSubmit(async (values) => {
+    setError(null)
+    try {
+      const { nextStep } = await resetPassword({ username: values.email })
+      onStep({
+        kind: "resetPassword",
+        email: values.email,
+        destination: nextStep.codeDeliveryDetails?.destination,
+      })
+    } catch (caught) {
+      setError(authErrorMessage(caught))
+    }
+  })
+
+  return (
+    <form onSubmit={onSubmit} noValidate className="grid gap-4">
+      <FormError message={error} />
+      <div className="grid gap-2">
+        <Label htmlFor="email">Email</Label>
+        <Input
+          id="email"
+          type="email"
+          autoComplete="email"
+          placeholder="you@example.com"
+          className="h-12"
+          aria-invalid={!!errors.email}
+          aria-describedby={errors.email ? "email-error" : undefined}
+          {...register("email")}
+        />
+        <FieldError id="email-error" message={errors.email?.message} />
+      </div>
+      <Button type="submit" disabled={isSubmitting} className="mt-2 h-12 w-full text-[0.95rem]">
+        {isSubmitting ? "Sending…" : "Send reset code"}
+      </Button>
+    </form>
+  )
+}
+
+function ResetPasswordForm({ step }: { step: Extract<Step, { kind: "resetPassword" }> }) {
+  const [error, setError] = useState<string | null>(null)
+  const {
+    register,
+    handleSubmit,
+    formState: { errors, isSubmitting },
+  } = useForm({ resolver: zodResolver(resetSchema) })
+
+  const onSubmit = handleSubmit(async (values) => {
+    setError(null)
+    try {
+      await confirmResetPassword({
+        username: step.email,
+        confirmationCode: values.code,
+        newPassword: values.password,
+      })
+      toast.success("Password changed")
+      await signIn({ username: step.email, password: values.password })
+    } catch (caught) {
+      setError(authErrorMessage(caught))
+    }
+  })
+
+  return (
+    <form onSubmit={onSubmit} noValidate className="grid gap-4">
+      <FormError message={error} />
+      <div className="grid gap-2">
+        <Label htmlFor="code">Reset code</Label>
+        <CodeInput invalid={!!errors.code} {...register("code")} />
+        <FieldError id="code-error" message={errors.code?.message} />
+      </div>
+      <div className="grid gap-2">
+        <Label htmlFor="password">New password</Label>
+        <PasswordInput
+          id="password"
+          autoComplete="new-password"
+          placeholder="8+ characters, upper & lower case, a number"
+          invalid={!!errors.password}
+          {...register("password")}
+        />
+        <FieldError id="password-error" message={errors.password?.message} />
+      </div>
+      <Button type="submit" disabled={isSubmitting} className="mt-2 h-12 w-full text-[0.95rem]">
+        {isSubmitting ? "Saving…" : "Set new password"}
+      </Button>
+    </form>
+  )
+}
+
+const HEADINGS: Record<Step["kind"], React.ReactNode> = {
+  signIn: (
+    <>
+      Log in or <span className="text-gradient-canva">sign up</span> in seconds
+    </>
+  ),
+  signUp: (
+    <>
+      Create your <span className="text-gradient-canva">free account</span>
+    </>
+  ),
+  confirmSignUp: (
+    <>
+      Check your <span className="text-gradient-canva">inbox</span>
+    </>
+  ),
+  forgotPassword: (
+    <>
+      Reset your <span className="text-gradient-canva">password</span>
+    </>
+  ),
+  resetPassword: (
+    <>
+      Choose a <span className="text-gradient-canva">new password</span>
+    </>
+  ),
+}
+
+function subtitle(step: Step): string {
+  switch (step.kind) {
+    case "signIn":
+    case "signUp":
+      return "Use your email or Google to continue with SuccessfulSuccess — it's free!"
+    case "confirmSignUp":
+      return `We emailed a 6-digit code to ${step.destination ?? step.email}. Enter it to finish signing up.`
+    case "forgotPassword":
+      return "Enter your account's email and we'll send you a code to reset your password."
+    case "resetPassword":
+      return `Enter the code we sent to ${step.destination ?? step.email} and your new password.`
+  }
+}
+
+export function AuthPage() {
+  const { status } = useAuth()
+  const router = useRouter()
+  const [step, setStep] = useState<Step>({ kind: "signIn" })
+
+  // Signed in already, or just now: straight to the app.
+  useEffect(() => {
+    if (status === "signedIn") router.replace("/today")
+  }, [status, router])
+
+  const onGoogle = async () => {
+    if (!authConfig.googleEnabled || !authConfig.domain) {
+      toast.info("Google sign-in isn't enabled on this deployment yet.")
+      return
+    }
+    try {
+      configureAuth()
+      await signInWithRedirect({ provider: "Google" })
+    } catch (caught) {
+      toast.error(authErrorMessage(caught))
+    }
+  }
+
+  const isEntry = step.kind === "signIn" || step.kind === "signUp"
+
+  if (status !== "signedOut") {
+    return (
+      <>
+        <SiteHeader />
+        <AuthLoading label={status === "signedIn" ? "Opening your meetings…" : undefined} />
+      </>
+    )
   }
 
   return (
@@ -111,114 +546,73 @@ export function AuthPage() {
         <div className="flex flex-col">
           <div className="flex flex-1 items-center justify-center py-6">
             <div className="bg-card w-full max-w-md rounded-[2rem] border p-8 shadow-[0_24px_60px_-20px_rgba(139,61,255,0.25)] sm:p-10">
-              <h1 className="text-center text-3xl font-extrabold tracking-tight">
-                {isLogin ? (
-                  <>
-                    Log in or <span className="text-gradient-canva">sign up</span> in seconds
-                  </>
-                ) : (
-                  <>
-                    Create your <span className="text-gradient-canva">free account</span>
-                  </>
-                )}
-              </h1>
-              <p className="text-muted-foreground mt-3 text-center text-sm">
-                Use your email or Google to continue with SuccessfulSuccess — it&apos;s free!
-              </p>
-
-              <Button
-                type="button"
-                variant="outline"
-                className="mt-8 h-12 w-full gap-3 text-[0.95rem]"
-                onClick={onGoogle}
-              >
-                <GoogleIcon />
-                Continue with Google
-              </Button>
-
-              <FieldSeparator className="my-6">or</FieldSeparator>
-
-              <form onSubmit={handleSubmit(onSubmit)} noValidate className="grid gap-4">
-                <div className="grid gap-2">
-                  <Label htmlFor="email">Email</Label>
-                  <Input
-                    id="email"
-                    type="email"
-                    autoComplete="email"
-                    placeholder="you@example.com"
-                    className="h-12"
-                    aria-invalid={!!errors.email}
-                    aria-describedby={errors.email ? "email-error" : undefined}
-                    {...register("email")}
-                  />
-                  {errors.email ? (
-                    <p id="email-error" className="text-destructive text-sm">
-                      {errors.email.message}
-                    </p>
-                  ) : null}
-                </div>
-
-                <div className="grid gap-2">
-                  <div className="flex items-center justify-between">
-                    <Label htmlFor="password">Password</Label>
-                    {isLogin ? (
-                      <button
-                        type="button"
-                        className="text-primary text-sm font-medium hover:underline"
-                        onClick={() => toast.info("Password reset isn't connected yet.")}
-                      >
-                        Forgot password?
-                      </button>
-                    ) : null}
-                  </div>
-                  <div className="relative">
-                    <Input
-                      id="password"
-                      type={showPassword ? "text" : "password"}
-                      autoComplete={isLogin ? "current-password" : "new-password"}
-                      placeholder="At least 8 characters"
-                      className="h-12 pr-12"
-                      aria-invalid={!!errors.password}
-                      aria-describedby={errors.password ? "password-error" : undefined}
-                      {...register("password")}
-                    />
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon"
-                      className="absolute top-1/2 right-2 -translate-y-1/2"
-                      aria-label={showPassword ? "Hide password" : "Show password"}
-                      onClick={() => setShowPassword((value) => !value)}
-                    >
-                      {showPassword ? <EyeOff /> : <Eye />}
-                    </Button>
-                  </div>
-                  {errors.password ? (
-                    <p id="password-error" className="text-destructive text-sm">
-                      {errors.password.message}
-                    </p>
-                  ) : null}
-                </div>
-
-                <Button
-                  type="submit"
-                  disabled={isSubmitting}
-                  className="mt-2 h-12 w-full text-[0.95rem]"
-                >
-                  {isLogin ? "Log in" : "Sign up"}
-                </Button>
-              </form>
-
-              <p className="text-muted-foreground mt-6 text-center text-sm">
-                {isLogin ? "Don't have an account?" : "Already have an account?"}{" "}
+              {!isEntry ? (
                 <button
                   type="button"
-                  className="text-primary font-semibold hover:underline"
-                  onClick={() => setMode(isLogin ? "signup" : "login")}
+                  className="text-muted-foreground hover:text-foreground mb-4 inline-flex items-center gap-1 text-sm font-medium"
+                  onClick={() => setStep({ kind: "signIn" })}
                 >
-                  {isLogin ? "Sign up" : "Log in"}
+                  <ArrowLeft className="size-4" aria-hidden />
+                  Back to log in
                 </button>
-              </p>
+              ) : null}
+
+              {step.kind === "confirmSignUp" ? (
+                <span className="tint-violet mx-auto mb-4 flex size-12 items-center justify-center rounded-full">
+                  <MailCheck className="size-5" aria-hidden />
+                </span>
+              ) : null}
+
+              <h1 className="text-center text-3xl font-extrabold tracking-tight">
+                {HEADINGS[step.kind]}
+              </h1>
+              <p className="text-muted-foreground mt-3 text-center text-sm">{subtitle(step)}</p>
+
+              {!isAuthConfigured ? (
+                <div className="tint-amber mt-6 rounded-2xl px-4 py-3 text-sm">
+                  Sign-in isn&apos;t configured. Run <code>make aws-deploy-auth</code> and put the
+                  values from <code>make aws-auth-env</code> in <code>.env</code>.
+                </div>
+              ) : null}
+
+              {isEntry ? (
+                <>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="mt-8 h-12 w-full gap-3 text-[0.95rem]"
+                    onClick={onGoogle}
+                  >
+                    <GoogleIcon />
+                    Continue with Google
+                  </Button>
+                  <FieldSeparator className="my-6">or</FieldSeparator>
+                </>
+              ) : (
+                <div className="mt-8" />
+              )}
+
+              {/* Keyed by step so each form starts empty. */}
+              {step.kind === "signIn" ? <SignInForm key="signIn" onStep={setStep} /> : null}
+              {step.kind === "signUp" ? <SignUpForm key="signUp" onStep={setStep} /> : null}
+              {step.kind === "confirmSignUp" ? <ConfirmSignUpForm step={step} /> : null}
+              {step.kind === "forgotPassword" ? <ForgotPasswordForm onStep={setStep} /> : null}
+              {step.kind === "resetPassword" ? <ResetPasswordForm step={step} /> : null}
+
+              {isEntry ? (
+                <p className="text-muted-foreground mt-6 text-center text-sm">
+                  {step.kind === "signIn" ? "Don't have an account?" : "Already have an account?"}{" "}
+                  <button
+                    type="button"
+                    className="text-primary font-semibold hover:underline"
+                    onClick={() =>
+                      setStep({ kind: step.kind === "signIn" ? "signUp" : "signIn" })
+                    }
+                  >
+                    {step.kind === "signIn" ? "Sign up" : "Log in"}
+                  </button>
+                </p>
+              ) : null}
 
               <p className="text-muted-foreground mt-6 text-center text-xs leading-relaxed">
                 By continuing, you agree to the SuccessfulSuccess Terms of Use and

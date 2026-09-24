@@ -116,10 +116,20 @@ Parameters:
     Default: INFO
     AllowedValues: [DEBUG, INFO, WARNING, ERROR]
 
-  SeedDemoData:
+  CognitoUserPoolId:
     Type: String
-    Default: "false"
-    AllowedValues: ["true", "false"]
+    Description: User pool whose access tokens the API accepts (the auth stack's UserPoolId).
+
+  CognitoClientId:
+    Type: String
+    Description: The app client those tokens must be issued to (the auth stack's UserPoolClientId).
+
+  CognitoJwks:
+    Type: String
+    Description: >-
+      The pool's public signing keys (its jwks.json), base64-encoded. The
+      function has no internet access to fetch them itself; `make
+      aws-deploy-backend` downloads them.
 
 Conditions:
   HasDbEngineVersion: !Not [!Equals [!Ref DbEngineVersion, ""]]
@@ -272,7 +282,10 @@ Resources:
           APP_TIMEZONE: !Ref AppTimezone
           CORS_ORIGINS: !Ref CorsOrigins
           LOG_LEVEL: !Ref LogLevel
-          SEED_DEMO_DATA: !Ref SeedDemoData
+          COGNITO_REGION: !Ref AWS::Region
+          COGNITO_USER_POOL_ID: !Ref CognitoUserPoolId
+          COGNITO_CLIENT_ID: !Ref CognitoClientId
+          COGNITO_JWKS: !Ref CognitoJwks
       Tags:
         - Key: PROJECT_NAME
           Value: !Ref ProjectName
@@ -280,7 +293,8 @@ Resources:
   # --- function URL ---------------------------------------------------------
 
   # The function's own HTTPS endpoint (https://<id>.lambda-url.<region>.on.aws).
-  # Public: the app has no authentication, as locally. CORS stays in FastAPI;
+  # Public: FastAPI itself checks the Cognito access token on every meetings
+  # request (the function URL cannot validate Cognito tokens). CORS stays in FastAPI;
   # configuring it here too would override the app's headers. The URL and the
   # permissions below take no tags.
   FunctionUrl:

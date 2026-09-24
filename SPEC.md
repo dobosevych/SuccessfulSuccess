@@ -26,7 +26,6 @@ The whole system (frontend, backend, database) starts with a single
 
 ### 1.2 Non-goals (v1)
 
-- Authentication / user accounts / authorization.
 - Recurring meetings, invitations, notifications, e-mail.
 - Calendar integrations (Google/Outlook), timezone selection per user.
 - Real-time updates (WebSockets) — the list refreshes on navigation/mutation.
@@ -93,7 +92,7 @@ SuccessfulSuccess/
 │  │  │  └─ v1/
 │  │  │     ├─ __init__.py        # APIRouter(prefix="/api/v1")
 │  │  │     └─ meetings.py        # endpoints
-│  │  └─ seed.py                  # optional demo data
+│  │  └─ seed.py                  # demo data for one user: python -m app.seed <sub>
 │  └─ tests/
 │     ├─ conftest.py              # test DB, httpx AsyncClient
 │     ├─ test_meetings_api.py
@@ -141,6 +140,7 @@ SuccessfulSuccess/
 | Field         | Type          | Rules |
 |---------------|---------------|-------|
 | `id`          | UUID (v4)     | PK, server-generated |
+| `owner_id`    | string \| null| FK → `users.id`, `ON DELETE CASCADE`; set from the caller's token, never the body. Null only on rows from before sign-in, which nobody sees |
 | `name`        | string        | required, 1–200 chars, trimmed, non-blank |
 | `description` | string \| null| optional, ≤ 2000 chars |
 | `starts_at`   | timestamptz   | required |
@@ -159,8 +159,21 @@ SuccessfulSuccess/
 | `email`      | string \| null | optional, validated e-mail, ≤ 255 chars |
 | `position`   | int            | ordering within the meeting, 0-based |
 
-Relationship: `Meeting 1 ── n Participant` (composition — participants have no life
-outside a meeting in v1).
+**User** (one per Cognito account; profile copied from the ID token by `POST /me/sync`)
+
+| Field            | Type           | Rules |
+|------------------|----------------|-------|
+| `id`             | string         | PK, the Cognito `sub` |
+| `email`          | string \| null | from the ID token |
+| `email_verified` | bool           | from the ID token |
+| `name`, `given_name`, `family_name` | string \| null | from the ID token |
+| `picture_url`    | string \| null | from the ID token (`picture`) |
+| `auth_provider`  | string         | `cognito` (email + password) or `google` |
+| `created_at`, `updated_at` | timestamptz | server-generated |
+| `last_login_at`  | timestamptz \| null | set on every sync |
+
+Relationships: `User 1 ── n Meeting 1 ── n Participant` (composition — participants
+have no life outside a meeting in v1).
 
 ### 3.2 Invariants
 
@@ -228,7 +241,10 @@ container start.
 | `CORS_ORIGINS`             | `http://localhost:3000`                                      | Comma-separated |
 | `LOG_LEVEL`                | `INFO`                                                       | |
 | `RUN_MIGRATIONS_ON_START`  | `true`                                                       | Entry-point runs `alembic upgrade head` |
-| `SEED_DEMO_DATA`           | `false`                                                      | Insert demo meetings if DB empty |
+| `COGNITO_REGION`           | `us-east-1`                                                  | Region of the user pool |
+| `COGNITO_USER_POOL_ID`     | *(empty)*                                                    | Pool whose access tokens the API accepts; empty refuses every request (`503`) |
+| `COGNITO_CLIENT_ID`        | *(empty)*                                                    | App client the tokens must be issued to |
+| `COGNITO_JWKS`             | *(empty)*                                                    | The pool's signing keys (JSON or base64 JSON); empty fetches them from Cognito |
 
 ### 4.3 REST API — `/api/v1`
 
@@ -365,6 +381,8 @@ has a `summary`, `response_model`, and documented error responses.
 8. `DELETE` removes the meeting and its participants.
 9. `GET /health` → `200` with `database: "ok"`.
 10. `PUT /meetings/{id}` replaces fields and participants; unknown id → `404`; invalid body → `422`.
+11. Without a valid Cognito access token every `/api/v1` request → `401`; a user never sees, edits or deletes another user's meeting (`404`).
+12. `POST /me/sync` stores the verified ID token's profile in `users`; an ID token for another user → `401`.
 
 Tests run against a real Postgres (a `db-test` service or the same instance with a
 separate database), each test in a rolled-back transaction.

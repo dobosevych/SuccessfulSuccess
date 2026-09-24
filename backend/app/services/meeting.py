@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.models import Meeting
 from app.repositories.meeting import MeetingRepository
+from app.repositories.user import UserRepository
 from app.schemas import MeetingCreate
 
 
@@ -30,8 +31,12 @@ def today() -> date:
 
 
 class MeetingService:
-    def __init__(self, session: AsyncSession) -> None:
-        self.repo = MeetingRepository(session)
+    """Meetings of one user: `owner_id` is the signed-in user's Cognito sub."""
+
+    def __init__(self, session: AsyncSession, owner_id: str) -> None:
+        self.repo = MeetingRepository(session, owner_id)
+        self.users = UserRepository(session)
+        self.owner_id = owner_id
 
     async def list_for_day(
         self,
@@ -54,6 +59,8 @@ class MeetingService:
         return meeting
 
     async def create(self, payload: MeetingCreate) -> Meeting:
+        # The owner's row may not exist yet if the profile sync has not run.
+        await self.users.ensure(self.owner_id)
         return await self.repo.create(payload)
 
     async def update(self, meeting_id: uuid.UUID, payload: MeetingCreate) -> Meeting:

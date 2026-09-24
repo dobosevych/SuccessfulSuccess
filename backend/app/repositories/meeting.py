@@ -1,4 +1,8 @@
-"""Database access for meetings. No HTTP concerns live here."""
+"""Database access for meetings. No HTTP concerns live here.
+
+Every query is scoped to one owner: a meeting that belongs to someone else
+behaves exactly like one that does not exist.
+"""
 
 import uuid
 from datetime import datetime
@@ -11,8 +15,9 @@ from app.schemas import MeetingCreate
 
 
 class MeetingRepository:
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(self, session: AsyncSession, owner_id: str) -> None:
         self.session = session
+        self.owner_id = owner_id
 
     def _overlap_filters(self, window_start: datetime, window_end: datetime):
         """A meeting overlaps the window when it starts before it ends and ends after it starts."""
@@ -26,7 +31,10 @@ class MeetingRepository:
         limit: int,
         offset: int,
     ) -> tuple[list[Meeting], int]:
-        filters = list(self._overlap_filters(window_start, window_end))
+        filters = [
+            Meeting.owner_id == self.owner_id,
+            *self._overlap_filters(window_start, window_end),
+        ]
         if query:
             pattern = f"%{query.strip()}%"
             filters.append(Meeting.name.ilike(pattern) | Meeting.description.ilike(pattern))
@@ -42,10 +50,13 @@ class MeetingRepository:
         return list(result), int(total or 0)
 
     async def get(self, meeting_id: uuid.UUID) -> Meeting | None:
-        return await self.session.get(Meeting, meeting_id)
+        return await self.session.scalar(
+            select(Meeting).where(Meeting.id == meeting_id, Meeting.owner_id == self.owner_id)
+        )
 
     async def create(self, payload: MeetingCreate) -> Meeting:
         meeting = Meeting(
+            owner_id=self.owner_id,
             name=payload.name,
             description=payload.description,
             location=payload.location,
@@ -77,9 +88,16 @@ class MeetingRepository:
         return meeting
 
     async def delete(self, meeting_id: uuid.UUID) -> bool:
-        result = await self.session.execute(delete(Meeting).where(Meeting.id == meeting_id))
+        result = await self.session.execute(
+            delete(Meeting).where(Meeting.id == meeting_id, Meeting.owner_id == self.owner_id)
+        )
         await self.session.commit()
         return bool(result.rowcount)
 
     async def count(self) -> int:
-        return int(await self.session.scalar(select(func.count()).select_from(Meeting)) or 0)
+        return int(
+            await self.session.scalar(
+                select(func.count()).select_from(Meeting).where(Meeting.owner_id == self.owner_id)
+            )
+            or 0
+        )

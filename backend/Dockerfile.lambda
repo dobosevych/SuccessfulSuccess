@@ -1,0 +1,22 @@
+# The image AWS Lambda runs (`make aws-push`). The plain Dockerfile stays the
+# local/compose image; this one swaps uvicorn for the Lambda runtime and serves
+# the same app through app.lambda_handler.
+FROM public.ecr.aws/lambda/python:3.12
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+WORKDIR ${LAMBDA_TASK_ROOT}
+
+# Lambda's filesystem is read-only, so compile the bytecode at build time.
+COPY pyproject.toml ./
+RUN uv pip install --no-cache --compile-bytecode --target "${LAMBDA_TASK_ROOT}" -r pyproject.toml
+
+COPY alembic.ini ./
+COPY alembic ./alembic
+COPY app ./app
+
+# Serves the function URL, and runs migrations when invoked with {"action": "migrate"}.
+CMD ["app.lambda_handler.handler"]

@@ -17,6 +17,7 @@ AWS ?= docker run --rm \
 	-v $(CURDIR):/aws -w /aws \
 	amazon/aws-cli:latest
 
+AUTH_STACK ?= $(PROJECT_NAME)-auth
 APP_STACK ?= $(PROJECT_NAME)-backend
 ECR_STACK ?= $(PROJECT_NAME)-ecr
 FRONTEND_STACK ?= $(PROJECT_NAME)-frontend
@@ -40,6 +41,10 @@ stack-output = $(AWS) cloudformation describe-stacks --stack-name $(1) \
 # CloudFormation refuses to update a stack that is still busy, and a Lambda in a
 # VPC can keep one in *_CLEANUP_IN_PROGRESS for ~20 minutes while its network
 # interfaces are released. Wait that out instead of failing.
+# $(call stack-outputs,<stack>): every output as "Key<TAB>Value" lines
+stack-outputs = $(AWS) cloudformation describe-stacks --stack-name $(1) \
+	--query 'Stacks[0].Outputs[].[OutputKey,OutputValue]' --output text
+
 # $(call wait-stack-idle,<stack>)
 wait-stack-idle = while status=$$($(AWS) cloudformation describe-stacks --stack-name $(1) \
 		--query 'Stacks[0].StackStatus' --output text 2>/dev/null | tr -d '[:space:]'); \
@@ -70,7 +75,7 @@ define require-db-password
 endef
 
 .PHONY: help up up-build down down-v logs ps migrate revision seed test lint fmt shell-backend psql \
-        aws-whoami aws-deploy aws-ecr aws-push aws-deploy-backend aws-migrate aws-url aws-status aws-logs \
+        aws-whoami aws-deploy aws-deploy-auth aws-auth-env aws-ecr aws-push aws-deploy-backend aws-migrate aws-url aws-status aws-logs \
         aws-frontend-cert aws-deploy-frontend aws-frontend-url aws-destroy
 
 help:
@@ -100,8 +105,9 @@ migrate: ## Apply database migrations
 revision: ## Autogenerate a migration: make revision m="add column"
 	$(COMPOSE) exec backend alembic revision --autogenerate -m "$(m)"
 
-seed: ## Insert demo meetings for today when the database is empty
-	$(COMPOSE) exec backend python -m app.seed
+seed: ## Insert demo meetings for today for one user: make seed owner=<cognito-sub>
+	@test -n "$(owner)" || { echo "Usage: make seed owner=<cognito-sub> (the user's sub from the Cognito console)"; exit 1; }
+	$(COMPOSE) exec backend python -m app.seed "$(owner)"
 
 test: ## Run the backend test suite against a throwaway database
 	$(COMPOSE) exec db psql -U app -d postgres -tc \
@@ -126,9 +132,42 @@ aws-whoami: ## Verify the AWS credentials in .env
 	$(require-aws-credentials)
 	$(AWS) sts get-caller-identity
 
-aws-deploy: ## Deploy everything: the backend first, then the frontend built against its URL
+aws-deploy: ## Deploy everything: sign-in, then the backend, then the frontend built against both
+	@$(MAKE) --no-print-directory aws-deploy-auth
 	@$(MAKE) --no-print-directory aws-deploy-backend
 	@$(MAKE) --no-print-directory aws-deploy-frontend
+
+aws-deploy-auth: ## Create/update the Cognito user pool (email + password; Google when GOOGLE_CLIENT_ID is set)
+	$(require-aws-credentials)
+	@urls="http://localhost:$(or $(FRONTEND_PORT),3000)/"; \
+		site=$$($(call stack-output,$(FRONTEND_STACK),AllowedOrigins) 2>/dev/null | tr -d '[:space:]'); \
+		case "$$site" in ""|None) ;; *) urls="$$urls,$$(echo "$$site" | sed 's|,|/,|g')/" ;; esac; \
+		echo "Sign-in redirect URLs: $$urls"; \
+		test -n "$(GOOGLE_CLIENT_ID)" || echo "GOOGLE_CLIENT_ID is empty — Google sign-in stays off"; \
+		$(call wait-stack-idle,$(AUTH_STACK)); \
+		$(call clear-failed-create,$(AUTH_STACK)); \
+		$(AWS) cloudformation deploy \
+			--stack-name $(AUTH_STACK) \
+			--template-file infra/auth.yml \
+			--no-fail-on-empty-changeset \
+			$(STACK_TAGS) \
+			--parameter-overrides \
+				"ProjectName=$(PROJECT_NAME)" \
+				"AppUrls=$$urls" \
+				"GoogleClientId=$(GOOGLE_CLIENT_ID)" \
+				"GoogleClientSecret=$(GOOGLE_CLIENT_SECRET)"
+	@if [ -n "$(GOOGLE_CLIENT_ID)" ]; then \
+		echo "Google Cloud console → the OAuth client → Authorized redirect URIs must include:"; \
+		echo "  $$($(call stack-output,$(AUTH_STACK),GoogleRedirectUri) | tr -d '[:space:]')"; \
+	fi
+	@$(MAKE) --no-print-directory aws-auth-env
+
+aws-auth-env: ## Print the Cognito settings to put in .env for local development
+	@$(call stack-outputs,$(AUTH_STACK)) | awk -F '\t' ' \
+		$$1 == "UserPoolId" { print "COGNITO_USER_POOL_ID=" $$2 } \
+		$$1 == "UserPoolClientId" { print "COGNITO_CLIENT_ID=" $$2 } \
+		$$1 == "HostedDomain" { print "COGNITO_DOMAIN=" $$2 } \
+		$$1 == "GoogleEnabled" { print "COGNITO_GOOGLE_ENABLED=" $$2 }' | tr -d '\r'
 
 aws-ecr: ## Create the ECR repository for the backend image
 	$(require-aws-credentials)
@@ -151,7 +190,13 @@ aws-push: aws-ecr ## Build the backend Lambda image and push it to ECR
 aws-deploy-backend: aws-push ## Deploy the backend to AWS (Lambda function URL + Aurora Serverless), then migrate
 	$(require-aws-credentials)
 	$(require-db-password)
-	@vpc=$$($(AWS) ec2 describe-vpcs --filters Name=isDefault,Values=true \
+	@pool=$$($(call stack-output,$(AUTH_STACK),UserPoolId) 2>/dev/null | tr -d '[:space:]'); \
+		client=$$($(call stack-output,$(AUTH_STACK),UserPoolClientId) | tr -d '[:space:]'); \
+		issuer=$$($(call stack-output,$(AUTH_STACK),Issuer) | tr -d '[:space:]'); \
+		case "$$pool" in ""|None) echo "No user pool found — run: make aws-deploy-auth"; exit 1 ;; esac; \
+		jwks=$$(curl -fsS "$$issuer/.well-known/jwks.json" | base64 | tr -d '\n'); \
+		test -n "$$jwks" || { echo "Could not download $$issuer/.well-known/jwks.json"; exit 1; }; \
+		vpc=$$($(AWS) ec2 describe-vpcs --filters Name=isDefault,Values=true \
 		--query 'Vpcs[0].VpcId' --output text | tr -d '[:space:]'); \
 		test "$$vpc" != "None" -a -n "$$vpc" || { \
 			echo "No default VPC in $(AWS_REGION) — pass VpcId/SubnetIds yourself"; exit 1; }; \
@@ -186,7 +231,9 @@ aws-deploy-backend: aws-push ## Deploy the backend to AWS (Lambda function URL +
 				"DbPassword=$(AWS_DB_PASSWORD)" \
 				"AppTimezone=$(APP_TIMEZONE)" \
 				"CorsOrigins=$$cors" \
-				"SeedDemoData=$(or $(AWS_SEED_DEMO_DATA),false)"
+				"CognitoUserPoolId=$$pool" \
+				"CognitoClientId=$$client" \
+				"CognitoJwks=$$jwks"
 	@$(MAKE) --no-print-directory aws-migrate
 	@$(MAKE) --no-print-directory aws-url
 
@@ -245,13 +292,22 @@ aws-deploy-frontend: ## Deploy the frontend to S3 + CloudFront, built against th
 				"ProjectName=$(PROJECT_NAME)" \
 				"PricingPlan=$(or $(AWS_CLOUDFRONT_PLAN),FREE)" \
 				$$domain
+	@# Now that the site's URL exists, let Cognito redirect back to it.
+	@$(MAKE) --no-print-directory aws-deploy-auth
 	@api=$$($(call stack-output,$(APP_STACK),ApiUrl) | tr -d '[:space:]'); \
+		auth=$$($(call stack-outputs,$(AUTH_STACK)) | tr -d '\r'); \
+		auth_out() { printf '%s\n' "$$auth" | awk -F '\t' -v k="$$1" '$$1 == k { print $$2 }'; }; \
 		bucket=$$($(call stack-output,$(FRONTEND_STACK),BucketName) | tr -d '[:space:]'); \
 		dist=$$($(call stack-output,$(FRONTEND_STACK),DistributionId) | tr -d '[:space:]'); \
 		echo "Building the static export against $$api"; \
 		rm -rf frontend/out; \
 		docker build --target export --output type=local,dest=frontend/out \
-			--build-arg NEXT_PUBLIC_API_BASE_URL="$$api" ./frontend || exit 1; \
+			--build-arg NEXT_PUBLIC_API_BASE_URL="$$api" \
+			--build-arg NEXT_PUBLIC_COGNITO_USER_POOL_ID="$$(auth_out UserPoolId)" \
+			--build-arg NEXT_PUBLIC_COGNITO_CLIENT_ID="$$(auth_out UserPoolClientId)" \
+			--build-arg NEXT_PUBLIC_COGNITO_DOMAIN="$$(auth_out HostedDomain)" \
+			--build-arg NEXT_PUBLIC_COGNITO_GOOGLE_ENABLED="$$(auth_out GoogleEnabled)" \
+			./frontend || exit 1; \
 		echo "Uploading to s3://$$bucket"; \
 		$(AWS) s3 sync frontend/out "s3://$$bucket" --delete --exclude "*.html" \
 			--cache-control "public,max-age=31536000,immutable" --only-show-errors || exit 1; \
@@ -276,8 +332,8 @@ aws-frontend-url: ## Print the deployed site URL
 
 aws-destroy: ## Delete every stack, including the database and its data
 	$(require-aws-credentials)
-	@printf 'Delete %s, %s and %s? The Aurora cluster and all its data go with them (no snapshot). Type yes: ' \
-		"$(FRONTEND_STACK)" "$(APP_STACK)" "$(ECR_STACK)"; \
+	@printf 'Delete %s, %s, %s and %s? The Aurora cluster and all its data, and every user account, go with them (no snapshot). Type yes: ' \
+		"$(FRONTEND_STACK)" "$(APP_STACK)" "$(AUTH_STACK)" "$(ECR_STACK)"; \
 		read answer; test "$$answer" = "yes" || { echo "Aborted."; exit 1; }
 	@bucket=$$($(call stack-output,$(FRONTEND_STACK),BucketName) 2>/dev/null | tr -d '[:space:]'); \
 		if [ -n "$$bucket" ] && [ "$$bucket" != "None" ]; then \
@@ -289,6 +345,8 @@ aws-destroy: ## Delete every stack, including the database and its data
 	@echo "Deleting $(APP_STACK) — Lambda releases its VPC network interfaces slowly, allow ~20 minutes."
 	$(AWS) cloudformation delete-stack --stack-name $(APP_STACK)
 	$(AWS) cloudformation wait stack-delete-complete --stack-name $(APP_STACK)
+	$(AWS) cloudformation delete-stack --stack-name $(AUTH_STACK)
+	$(AWS) cloudformation wait stack-delete-complete --stack-name $(AUTH_STACK)
 	$(AWS) cloudformation delete-stack --stack-name $(ECR_STACK)
 	$(AWS) cloudformation wait stack-delete-complete --stack-name $(ECR_STACK)
 	@echo "All stacks deleted."

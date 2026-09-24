@@ -1,9 +1,13 @@
+import { signOut } from "aws-amplify/auth"
+
+import { getAccessToken } from "@/lib/auth"
 import type {
   ApiErrorBody,
   ApiErrorDetail,
   Meeting,
   MeetingCreateInput,
   MeetingList,
+  UserProfile,
 } from "@/lib/types"
 
 export const API_BASE_URL =
@@ -24,15 +28,26 @@ export class ApiError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const token = await getAccessToken()
   let response: Response
   try {
     response = await fetch(`${API_BASE_URL}${path}`, {
       ...init,
-      headers: { "Content-Type": "application/json", ...init?.headers },
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...init?.headers,
+      },
       cache: "no-store",
     })
   } catch {
     throw new ApiError(0, "network_error", "Could not reach the meetings API.", [])
+  }
+
+  // The session is gone or was revoked: sign out, and the auth guard sends the
+  // user back to the login page.
+  if (response.status === 401) {
+    void signOut()
   }
 
   if (response.status === 204) {
@@ -83,4 +98,16 @@ export function updateMeeting(id: string, payload: MeetingCreateInput) {
 
 export function deleteMeeting(id: string) {
   return request<void>(`/api/v1/meetings/${id}`, { method: "DELETE" })
+}
+
+export function getMe() {
+  return request<UserProfile>("/api/v1/me")
+}
+
+/** Stores the profile from the ID token in the users table; call after signing in. */
+export function syncMe(idToken: string) {
+  return request<UserProfile>("/api/v1/me/sync", {
+    method: "POST",
+    body: JSON.stringify({ id_token: idToken }),
+  })
 }

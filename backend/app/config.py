@@ -15,8 +15,17 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:3000"
     log_level: str = "INFO"
     run_migrations_on_start: bool = True
-    seed_demo_data: bool = False
     version: str = Field(default="1.0.0")
+
+    # Cognito user pool whose access tokens the API accepts. Empty pool id means
+    # authentication is not configured, and every meetings request is refused.
+    cognito_region: str = "us-east-1"
+    cognito_user_pool_id: str = ""
+    cognito_client_id: str = ""
+    # The pool's signing keys (JSON, or that JSON base64-encoded). The Lambda
+    # runs in a VPC without internet access, so the deploy passes them in; when
+    # empty they are fetched from Cognito on first use.
+    cognito_jwks: str = ""
 
     @field_validator("app_timezone")
     @classmethod
@@ -27,6 +36,12 @@ class Settings(BaseSettings):
     @property
     def tz(self) -> ZoneInfo:
         return ZoneInfo(self.app_timezone)
+
+    @property
+    def cognito_issuer(self) -> str:
+        return (
+            f"https://cognito-idp.{self.cognito_region}.amazonaws.com/{self.cognito_user_pool_id}"
+        )
 
     @property
     def cors_origin_list(self) -> list[str]:

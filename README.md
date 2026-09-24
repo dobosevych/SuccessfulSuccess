@@ -24,8 +24,37 @@ Then open:
 | API docs (Swagger) | http://localhost:8000/docs |
 | Health check | http://localhost:8000/health |
 
-The backend applies migrations on start and seeds a few demo meetings for today
-when the database is empty (`SEED_DEMO_DATA=true`).
+The backend applies migrations on start.
+
+### Sign-in (Cognito)
+
+Every page except the login page, and every `/api/v1` endpoint, needs a
+signed-in user, and each user sees only their own meetings. Sign-in is an AWS
+Cognito user pool (`infra/auth.yml`): email + password, and Google when it is
+configured. Even for local development the pool lives in AWS (it is free at
+this scale):
+
+```bash
+make aws-deploy-auth   # create/update the user pool; allows http://localhost:$FRONTEND_PORT/
+make aws-auth-env      # prints COGNITO_* lines: paste them into .env
+docker compose up -d   # restart so the API and the frontend pick them up
+```
+
+**Google sign-in** (optional): in Google Cloud console create an OAuth client of
+type *Web application*, put its id and secret in `.env` as `GOOGLE_CLIENT_ID` /
+`GOOGLE_CLIENT_SECRET`, run `make aws-deploy-auth`, and add the redirect URI it
+prints (`https://<prefix>.auth.<region>.amazoncognito.com/oauth2/idpresponse`)
+to the client's *Authorized redirect URIs*. Without it the Google button says
+Google sign-in is not enabled.
+
+The first time someone signs in, the frontend sends their ID token to
+`POST /api/v1/me/sync`, which stores their profile (email, name, picture,
+provider, last login) in the `users` table. Meetings reference `users.id`, the
+Cognito `sub`.
+
+Demo data is per user: `make seed owner=<sub>` adds a few meetings for today to
+that user (their `sub` is on the user's page in the Cognito console, or `id` in
+`GET /api/v1/me`).
 
 > **Ports already in use?** Every host port is configurable in `.env`
 > (`FRONTEND_PORT`, `BACKEND_PORT`, `POSTGRES_PORT`). If you change the frontend
@@ -41,14 +70,16 @@ make down-v      # stop it and drop the database volume
 make test        # backend test suite (creates meetings_test automatically)
 make lint        # ruff + eslint
 make migrate     # alembic upgrade head
+make seed owner=<sub>  # demo meetings for today for one user
 make psql        # psql shell against the app database
 make help        # everything else
 ```
 
 ## Deploy to AWS
 
-`infra/` holds three CloudFormation templates: `ecr.yml` (image registry),
-`backend.yml` (API and database) and `frontend.yml` (site). `make` reads `.env`,
+`infra/` holds four CloudFormation templates: `auth.yml` (Cognito sign-in),
+`ecr.yml` (image registry), `backend.yml` (API and database) and `frontend.yml`
+(site). `make` reads `.env`,
 so the `aws-*` targets pick up the credentials and settings from there; `.env` is
 gitignored, so real keys never reach the repository. The AWS CLI runs in the
 `amazon/aws-cli` container, so nothing has to be installed on the host besides
@@ -73,12 +104,18 @@ Cost Explorer or Resource Groups to see everything the project owns.
 
 ```bash
 make aws-whoami   # check the credentials work
-make aws-deploy   # backend first, then the frontend built against the backend's URL
+make aws-deploy   # sign-in, then the backend, then the frontend built against both
 ```
 
-`aws-deploy` runs the two steps below in order: the frontend bakes the API URL
-into its build, so the backend has to exist first. Each step can also run on its
-own.
+`aws-deploy` runs `aws-deploy-auth` and then the two steps below in order: the
+backend checks tokens from the user pool, and the frontend bakes the API URL and
+the pool's ids into its build. Each step can also run on its own.
+
+The backend Lambda sits in a VPC with no internet access, so it cannot download
+the pool's signing keys itself; `aws-deploy-backend` fetches them
+(`<issuer>/.well-known/jwks.json`) and passes them in as `COGNITO_JWKS`.
+`aws-deploy-frontend` re-deploys the auth stack once the CloudFront URL exists,
+so Cognito may redirect back to the site after Google sign-in.
 
 Fill these in `.env` first:
 
@@ -89,7 +126,8 @@ AWS_REGION=us-east-1
 PROJECT_NAME=successfulsuccess   # prefixes every resource name, and the PROJECT_NAME tag
 AWS_DB_PASSWORD=...          # 8-41 chars, [A-Za-z0-9_-] only
 AWS_CORS_ORIGINS=            # empty: follow the frontend's URLs (* until it exists)
-AWS_SEED_DEMO_DATA=false     # true seeds demo meetings into an empty database
+GOOGLE_CLIENT_ID=            # optional: Google sign-in (see "Sign-in" above)
+GOOGLE_CLIENT_SECRET=
 AWS_FRONTEND_DOMAIN=         # optional, e.g. app.example.com
 ```
 
@@ -235,22 +273,33 @@ tier — check your billing console rather than assuming.
   well under the cluster's connection limit. Once the limit is raised, set
   `MaxConcurrency` to keep a spike off the database; requests beyond it get
   HTTP 429. RDS Proxy is the proper fix, and it is not free.
-- The function URL is public, like the local API: there is no authentication
-  and no request throttling in front of it beyond the concurrency limit.
+- The function URL is public: FastAPI checks the Cognito access token on every
+  `/api/v1` request, but there is no request throttling in front of it beyond
+  the concurrency limit.
+- Cognito sends its emails (sign-up codes, password resets) itself, capped at 50
+  a day. Switch the pool to SES before real traffic.
+- Signing up with a password and later with Google under the same email makes
+  two separate Cognito users, with separate meetings. Linking them needs a
+  pre-sign-up Lambda trigger.
 - Deleting the backend stack takes ~20 minutes: Lambda releases its VPC network
   interfaces slowly, and the security groups wait for them.
 - One Aurora instance: there is no reader to fail over to.
 
 ## API
 
-Base path `/api/v1`. Full schema at `/docs`.
+Base path `/api/v1`. Full schema at `/docs`. Everything under it needs
+`Authorization: Bearer <Cognito access token>` (`401` otherwise) and only ever
+touches the caller's own meetings: someone else's meeting is a `404`.
 
 | Method | Path | Purpose |
 |--------|------|---------|
 | `GET` | `/meetings?date=&q=&limit=&offset=` | Meetings overlapping a day (today by default) |
 | `GET` | `/meetings/{id}` | One meeting |
 | `POST` | `/meetings` | Create a meeting |
+| `PUT` | `/meetings/{id}` | Replace a meeting's details and participants |
 | `DELETE` | `/meetings/{id}` | Delete a meeting and its participants |
+| `GET` | `/me` | The signed-in user's profile |
+| `POST` | `/me/sync` | Store the profile from the user's ID token (after sign-in) |
 | `GET` | `/health` | Liveness + database check |
 
 Every error uses one envelope:

@@ -1,0 +1,145 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Sign-in for the meetings app: a Cognito user pool where people sign up with
+  their email and a password, optionally federated with Google, plus the public
+  app client the Next.js frontend signs in through. The backend accepts the
+  access tokens this pool issues to that client.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: successfulsuccess
+    Description: Prefix for the names of the resources in this stack.
+
+  AppUrls:
+    Type: CommaDelimitedList
+    Default: "http://localhost:3000/"
+    Description: >-
+      Every URL the site is served from, each ending in "/": Cognito sends
+      people back there after signing in with Google or signing out. Include
+      the local dev server and the CloudFront site.
+
+  GoogleClientId:
+    Type: String
+    Default: ""
+    Description: >-
+      OAuth client id of a Google Cloud "Web application" client. Empty leaves
+      Google sign-in out; email and password still work.
+
+  GoogleClientSecret:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: That Google client's secret.
+
+Conditions:
+  HasGoogle: !Not [!Equals [!Ref GoogleClientId, ""]]
+
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${ProjectName}-users"
+      # People sign in with their email address; Cognito mails them a code to
+      # confirm it on sign-up and to reset a forgotten password.
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      UsernameConfiguration:
+        CaseSensitive: false
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          TemporaryPasswordValidityDays: 7
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+      # Cognito's own mailer: free, but capped at 50 emails a day. Switch to SES
+      # before real traffic arrives.
+      EmailConfiguration:
+        EmailSendingAccount: COGNITO_DEFAULT
+      UserPoolTags:
+        PROJECT_NAME: !Ref ProjectName
+
+  # Hosts the OAuth endpoints Google sign-in goes through:
+  # https://<prefix>.auth.<region>.amazoncognito.com
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      # Domain prefixes are unique per region across all accounts.
+      Domain: !Sub "${ProjectName}-${AWS::AccountId}"
+
+  GoogleIdentityProvider:
+    Type: AWS::Cognito::UserPoolIdentityProvider
+    Condition: HasGoogle
+    Properties:
+      UserPoolId: !Ref UserPool
+      ProviderName: Google
+      ProviderType: Google
+      ProviderDetails:
+        client_id: !Ref GoogleClientId
+        client_secret: !Ref GoogleClientSecret
+        authorize_scopes: openid email profile
+      AttributeMapping:
+        email: email
+        email_verified: email_verified
+        name: name
+
+  # Public client for the browser: no secret, SRP for passwords (the password
+  # never leaves the browser), and the authorization-code flow with PKCE for
+  # Google.
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${ProjectName}-web"
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+      # Referencing the provider (its name) also makes the client wait for it.
+      SupportedIdentityProviders: !If
+        - HasGoogle
+        - [COGNITO, !Ref GoogleIdentityProvider]
+        - [COGNITO]
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile]
+      CallbackURLs: !Ref AppUrls
+      LogoutURLs: !Ref AppUrls
+
+Outputs:
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  Issuer:
+    Description: The "iss" of every token; its signing keys are at <Issuer>/.well-known/jwks.json
+    Value: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
+  HostedDomain:
+    Description: Cognito's OAuth domain, which the frontend sends Google sign-in through
+    Value: !Sub "${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com"
+  GoogleRedirectUri:
+    Description: Add this to the Google client's "Authorized redirect URIs"
+    Value: !Sub "https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/idpresponse"
+  GoogleEnabled:
+    Value: !If [HasGoogle, "true", "false"]

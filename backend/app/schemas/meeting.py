@@ -122,3 +122,23 @@ class MeetingList(BaseModel):
     limit: int
     offset: int
     date: str
+
+
+class UserRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    email: str | None
+    email_verified: bool
+    name: str | None
+    given_name: str | None
+    family_name: str | None
+    picture_url: str | None
+    auth_provider: str
+    created_at: datetime
+    updated_at: datetime
+    last_login_at: datetime | None
+
+
+class UserSync(BaseModel):
+    id_token: str = Field(min_length=1, description="The Cognito ID token from the same sign-in")

@@ -24,10 +24,16 @@ class Meeting(Base):
     __table_args__ = (
         CheckConstraint("ends_at > starts_at", name="meetings_time_order"),
         Index("ix_meetings_starts_at", "starts_at"),
+        Index("ix_meetings_owner_id_starts_at", "owner_id", "starts_at"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
         PgUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    # The owning user (their Cognito sub). Null only on rows created before
+    # sign-in existed; no user can see those.
+    owner_id: Mapped[str | None] = mapped_column(
+        String(128), ForeignKey("users.id", ondelete="CASCADE"), nullable=True
     )
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
