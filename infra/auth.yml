@@ -11,9 +11,15 @@ Parameters:
     Default: successfulsuccess
     Description: Prefix for the names of the resources in this stack.
 
+  DomainPrefix:
+    Type: String
+    Default: ""
+    Description: >-
+      Prefix for Cognito UserPoolDomain. If empty, defaults to ${ProjectName}-${AWS::AccountId}.
+
   AppUrls:
     Type: CommaDelimitedList
-    Default: "http://localhost:3000/"
+    Default: "http://localhost:3000/,http://localhost:3000/auth/callback/"
     Description: >-
       Every URL the site is served from, each ending in "/": Cognito sends
       people back there after signing in with Google or signing out. Include
@@ -34,16 +40,18 @@ Parameters:
 
 Conditions:
   HasGoogle: !Not [!Equals [!Ref GoogleClientId, ""]]
+  HasDomainPrefix: !Not [!Equals [!Ref DomainPrefix, ""]]
 
 Resources:
   UserPool:
     Type: AWS::Cognito::UserPool
     Properties:
       UserPoolName: !Sub "${ProjectName}-users"
-      # People sign in with their email address; Cognito mails them a code to
-      # confirm it on sign-up and to reset a forgotten password.
       UsernameAttributes: [email]
       AutoVerifiedAttributes: [email]
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+      UserPoolTier: ESSENTIALS
       UsernameConfiguration:
         CaseSensitive: false
       AccountRecoverySetting:
@@ -63,21 +71,19 @@ Resources:
           AttributeDataType: String
           Required: true
           Mutable: true
-      # Cognito's own mailer: free, but capped at 50 emails a day. Switch to SES
-      # before real traffic arrives.
       EmailConfiguration:
         EmailSendingAccount: COGNITO_DEFAULT
       UserPoolTags:
-        PROJECT_NAME: !Ref ProjectName
+        PROJECT_NAME: demo
 
-  # Hosts the OAuth endpoints Google sign-in goes through:
+  # Hosts the OAuth endpoints:
   # https://<prefix>.auth.<region>.amazoncognito.com
   UserPoolDomain:
     Type: AWS::Cognito::UserPoolDomain
     Properties:
       UserPoolId: !Ref UserPool
-      # Domain prefixes are unique per region across all accounts.
-      Domain: !Sub "${ProjectName}-${AWS::AccountId}"
+      Domain: !If [HasDomainPrefix, !Ref DomainPrefix, !Sub "${ProjectName}-${AWS::AccountId}"]
+      ManagedLoginVersion: 2
 
   GoogleIdentityProvider:
     Type: AWS::Cognito::UserPoolIdentityProvider
@@ -95,11 +101,13 @@ Resources:
         email_verified: email_verified
         name: name
 
-  # Public client for the browser: no secret, SRP for passwords (the password
-  # never leaves the browser), and the authorization-code flow with PKCE for
-  # Google.
+  # Public client for the browser: no secret, SRP for passwords,
+  # and authorization-code flow with PKCE.
   UserPoolClient:
     Type: AWS::Cognito::UserPoolClient
+    DependsOn:
+      - UserPoolDomain
+      - GoogleIdentityProvider
     Properties:
       ClientName: !Sub "${ProjectName}-web"
       UserPoolId: !Ref UserPool
@@ -116,22 +124,32 @@ Resources:
         AccessToken: hours
         IdToken: hours
         RefreshToken: days
-      # Referencing the provider (its name) also makes the client wait for it.
-      SupportedIdentityProviders: !If
-        - HasGoogle
-        - [COGNITO, !Ref GoogleIdentityProvider]
-        - [COGNITO]
+      SupportedIdentityProviders:
+        - COGNITO
+        - Google
       AllowedOAuthFlowsUserPoolClient: true
       AllowedOAuthFlows: [code]
       AllowedOAuthScopes: [openid, email, profile]
       CallbackURLs: !Ref AppUrls
       LogoutURLs: !Ref AppUrls
 
+  ManagedLoginBranding:
+    Type: AWS::Cognito::ManagedLoginBranding
+    DependsOn:
+      - UserPoolDomain
+      - UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientId: !Ref UserPoolClient
+      UseCognitoProvidedValues: true
+
 Outputs:
   UserPoolId:
     Value: !Ref UserPool
   UserPoolClientId:
     Value: !Ref UserPoolClient
+  DomainPrefix:
+    Value: !If [HasDomainPrefix, !Ref DomainPrefix, !Sub "${ProjectName}-${AWS::AccountId}"]
   Issuer:
     Description: The "iss" of every token; its signing keys are at <Issuer>/.well-known/jwks.json
     Value: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"

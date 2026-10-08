@@ -1,119 +1,232 @@
 "use client"
 
 import { useQueryClient } from "@tanstack/react-query"
-import { Hub } from "aws-amplify/utils"
-import { fetchAuthSession, signOut as amplifySignOut } from "aws-amplify/auth"
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react"
-import { toast } from "sonner"
+import { WebStorageStateStore } from "oidc-client-ts"
+import {
+  AuthProvider as OidcAuthProvider,
+  useAuth as useOidcAuth,
+  type AuthProviderProps,
+} from "react-oidc-context"
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react"
 
 import { syncMe } from "@/lib/api"
-import { authErrorMessage, configureAuth, isAuthConfigured } from "@/lib/auth"
+import {
+  authConfig,
+  authority,
+  getPostLogoutRedirectUri,
+  getRedirectUri,
+  isAuthConfigured,
+  signOutRedirect,
+} from "@/lib/auth"
 
 export type AuthUser = {
   sub: string
   email?: string
   name?: string
+  profile?: Record<string, unknown>
 }
 
 type AuthState =
-  | { status: "loading"; user: null }
-  | { status: "signedOut"; user: null }
-  | { status: "signedIn"; user: AuthUser }
+  | { status: "loading"; user: null; isAuthenticated: false; isLoading: true }
+  | { status: "signedOut"; user: null; isAuthenticated: false; isLoading: false }
+  | { status: "signedIn"; user: AuthUser; isAuthenticated: true; isLoading: false }
 
-type AuthContextValue = AuthState & {
-  refresh: () => Promise<void>
+export type AuthContextValue = AuthState & {
+  oidcUser: ReturnType<typeof useOidcAuth>["user"]
+  signinRedirect: ReturnType<typeof useOidcAuth>["signinRedirect"]
+  removeUser: ReturnType<typeof useOidcAuth>["removeUser"]
   signOut: () => Promise<void>
+  refresh: () => Promise<void>
+  error?: Error
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null)
 
-/** Reads who is signed in from the ID token; null when nobody is. */
-async function loadUser(): Promise<{ user: AuthUser; idToken: string } | null> {
-  try {
-    const { tokens } = await fetchAuthSession()
-    const idToken = tokens?.idToken
-    const claims = idToken?.payload
-    if (!idToken || !claims?.sub) return null
-    return {
-      idToken: idToken.toString(),
-      user: {
-        sub: String(claims.sub),
-        email: typeof claims.email === "string" ? claims.email : undefined,
-        name: typeof claims.name === "string" ? claims.name : undefined,
-      },
-    }
-  } catch {
-    return null
-  }
-}
-
-export function AuthProvider({ children }: { children: React.ReactNode }) {
+function InnerAuthProvider({ children }: { children: React.ReactNode }) {
+  const oidcAuth = useOidcAuth()
   const queryClient = useQueryClient()
-  const [state, setState] = useState<AuthState>({ status: "loading", user: null })
-
-  // The sub whose profile was already stored this page load.
   const syncedSub = useRef<string | null>(null)
 
+  const signOut = useCallback(async () => {
+    queryClient.clear()
+    syncedSub.current = null
+    await signOutRedirect(oidcAuth)
+  }, [oidcAuth, queryClient])
+
   const refresh = useCallback(async () => {
-    const loaded = await loadUser()
-    if (!loaded) {
-      setState({ status: "signedOut", user: null })
-      return
+    // If needed, oidc-client-ts silently renews or gets user
+    if (oidcAuth.isAuthenticated && oidcAuth.user) {
+      const sub = oidcAuth.user.profile.sub
+      if (syncedSub.current !== sub && oidcAuth.user.id_token) {
+        syncedSub.current = sub
+        syncMe(oidcAuth.user.id_token).catch((err) =>
+          console.warn("Profile sync failed:", err)
+        )
+      }
     }
-    setState({ status: "signedIn", user: loaded.user })
-    // Keep the users table current (email, name, provider, last login). Not
-    // critical to the page, so a failure is only logged.
-    if (syncedSub.current !== loaded.user.sub) {
-      syncedSub.current = loaded.user.sub
-      syncMe(loaded.idToken).catch((error) => console.warn("Profile sync failed", error))
-    }
-  }, [])
+  }, [oidcAuth.isAuthenticated, oidcAuth.user])
 
   useEffect(() => {
-    if (!isAuthConfigured) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect -- no pool, so nobody can be signed in
-      setState({ status: "signedOut", user: null })
-      return
-    }
-    configureAuth()
-    void refresh()
-
-    return Hub.listen("auth", ({ payload }) => {
-      switch (payload.event) {
-        case "signedIn":
-        case "signInWithRedirect":
-          // Another user's meetings must never show from the cache.
-          queryClient.clear()
-          void refresh()
-          break
-        case "signedOut":
-        case "tokenRefresh_failure":
-          queryClient.clear()
-          syncedSub.current = null
-          setState({ status: "signedOut", user: null })
-          break
-        case "signInWithRedirect_failure":
-          toast.error("Google sign-in failed. Please try again.")
-          break
+    if (oidcAuth.isAuthenticated && oidcAuth.user) {
+      const sub = oidcAuth.user.profile.sub
+      if (syncedSub.current !== sub && oidcAuth.user.id_token) {
+        syncedSub.current = sub
+        syncMe(oidcAuth.user.id_token).catch((err) =>
+          console.warn("Profile sync failed:", err)
+        )
       }
-    })
-  }, [queryClient, refresh])
-
-  const signOut = useCallback(async () => {
-    try {
-      await amplifySignOut()
-    } catch (error) {
-      toast.error(authErrorMessage(error))
+    } else if (!oidcAuth.isLoading && !oidcAuth.isAuthenticated) {
+      syncedSub.current = null
     }
-  }, [])
+  }, [oidcAuth.isAuthenticated, oidcAuth.user, oidcAuth.isLoading])
 
-  const value = useMemo(() => ({ ...state, refresh, signOut }), [state, refresh, signOut])
+  const state = useMemo((): AuthState => {
+    if (oidcAuth.isLoading) {
+      return {
+        status: "loading",
+        user: null,
+        isAuthenticated: false,
+        isLoading: true,
+      }
+    }
+    if (oidcAuth.isAuthenticated && oidcAuth.user) {
+      const profile = oidcAuth.user.profile as Record<string, unknown>
+      const email =
+        typeof profile.email === "string"
+          ? profile.email
+          : typeof profile["cognito:username"] === "string"
+          ? profile["cognito:username"]
+          : undefined
+      const name = typeof profile.name === "string" ? profile.name : undefined
+
+      return {
+        status: "signedIn",
+        user: {
+          sub: typeof profile.sub === "string" ? profile.sub : String(profile.sub ?? ""),
+          email,
+          name,
+          profile,
+        },
+        isAuthenticated: true,
+        isLoading: false,
+      }
+    }
+    return {
+      status: "signedOut",
+      user: null,
+      isAuthenticated: false,
+      isLoading: false,
+    }
+  }, [oidcAuth.isLoading, oidcAuth.isAuthenticated, oidcAuth.user])
+
+  const value = useMemo(
+    (): AuthContextValue => ({
+      ...state,
+      oidcUser: oidcAuth.user,
+      signinRedirect: oidcAuth.signinRedirect,
+      removeUser: oidcAuth.removeUser,
+      signOut,
+      refresh,
+      error: oidcAuth.error,
+    }),
+    [state, oidcAuth.user, oidcAuth.signinRedirect, oidcAuth.removeUser, signOut, refresh, oidcAuth.error]
+  )
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
 }
 
-export function useAuth() {
+export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const [mounted, setMounted] = useState(false)
+
+  useEffect(() => {
+    setMounted(true)
+  }, [])
+
+  const oidcConfig: AuthProviderProps = useMemo(() => {
+    const redirectUri = getRedirectUri()
+    const postLogoutUri = getPostLogoutRedirectUri()
+
+    return {
+      authority,
+      client_id: authConfig.clientId,
+      redirect_uri: redirectUri,
+      post_logout_redirect_uri: postLogoutUri,
+      response_type: "code",
+      scope: "openid email profile",
+      automaticSilentRenew: true,
+      userStore:
+        typeof window !== "undefined"
+          ? new WebStorageStateStore({ store: window.localStorage })
+          : undefined,
+      onSigninCallback: () => {
+        if (typeof window !== "undefined") {
+          window.history.replaceState({}, document.title, window.location.pathname)
+          window.location.replace("/")
+        }
+      },
+    }
+  }, [])
+
+  if (!isAuthConfigured) {
+    // Unconfigured fallback
+    const fallbackValue: AuthContextValue = {
+      status: "signedOut",
+      user: null,
+      isAuthenticated: false,
+      isLoading: false,
+      oidcUser: null,
+      signinRedirect: async () => {},
+      removeUser: async () => {},
+      signOut: async () => {},
+      refresh: async () => {},
+      error: undefined,
+    }
+    return (
+      <AuthContext.Provider value={fallbackValue}>{children}</AuthContext.Provider>
+    )
+  }
+
+  // During SSR or pre-mount, render children safely wrapped in AuthContext
+  if (!mounted) {
+    return (
+      <AuthContext.Provider value={AUTH_FALLBACK}>
+        {children}
+      </AuthContext.Provider>
+    )
+  }
+
+  return (
+    <OidcAuthProvider {...oidcConfig}>
+      <InnerAuthProvider>{children}</InnerAuthProvider>
+    </OidcAuthProvider>
+  )
+}
+
+/** Safe default returned during SSR / before the client mounts. */
+const AUTH_FALLBACK: AuthContextValue = {
+  status: "loading",
+  user: null,
+  isAuthenticated: false,
+  isLoading: true,
+  oidcUser: null,
+  signOut: async () => {},
+  refresh: async () => {},
+  signinRedirect: async () => {},
+  removeUser: async () => {},
+  error: undefined,
+}
+
+export function useAuth(): AuthContextValue {
   const context = useContext(AuthContext)
-  if (!context) throw new Error("useAuth must be used inside <AuthProvider>")
-  return context
+  // During SSR or static prerendering there is no provider — return a safe
+  // loading state so pages don't crash at build time.
+  return context ?? AUTH_FALLBACK
 }

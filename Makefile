@@ -1,3 +1,4 @@
+SHELL := d:/Інна/Git/bin/bash.exe
 COMPOSE ?= docker compose
 
 # Local configuration (gitignored). These assignments beat variables exported in
@@ -6,7 +7,8 @@ COMPOSE ?= docker compose
 -include .env
 # Every stack (ECR, Lambda, Aurora, S3 + CloudFront) is created in this one region.
 AWS_REGION ?= us-east-1
-export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_REGION PROJECT_NAME
+AWS_DEFAULT_REGION ?= $(AWS_REGION)
+export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_REGION AWS_DEFAULT_REGION PROJECT_NAME
 
 # The AWS CLI runs in a container so nothing has to be installed on the host.
 # The repository is mounted at /aws (the image's workdir) so the CLI can read
@@ -139,18 +141,18 @@ aws-deploy: ## Deploy everything: sign-in, then the backend, then the frontend b
 
 aws-deploy-auth: ## Create/update the Cognito user pool (email + password; Google when GOOGLE_CLIENT_ID is set)
 	$(require-aws-credentials)
-	@urls="http://localhost:$(or $(FRONTEND_PORT),3000)/"; \
+	@urls="http://localhost:$(or $(FRONTEND_PORT),3000)/,http://localhost:$(or $(FRONTEND_PORT),3000)/auth/callback/"; \
 		site=$$($(call stack-output,$(FRONTEND_STACK),AllowedOrigins) 2>/dev/null | tr -d '[:space:]'); \
-		case "$$site" in ""|None) ;; *) urls="$$urls,$$(echo "$$site" | sed 's|,|/,|g')/" ;; esac; \
+		case "$$site" in ""|None) ;; *) urls="$$urls,$$(echo "$$site" | sed 's|,|/,|g')/,$$(echo "$$site" | sed 's|,|/auth/callback/,|g')/auth/callback/" ;; esac; \
 		echo "Sign-in redirect URLs: $$urls"; \
 		test -n "$(GOOGLE_CLIENT_ID)" || echo "GOOGLE_CLIENT_ID is empty — Google sign-in stays off"; \
-		$(call wait-stack-idle,$(AUTH_STACK)); \
 		$(call clear-failed-create,$(AUTH_STACK)); \
 		$(AWS) cloudformation deploy \
 			--stack-name $(AUTH_STACK) \
 			--template-file infra/auth.yml \
 			--no-fail-on-empty-changeset \
 			$(STACK_TAGS) \
+		--capabilities CAPABILITY_NAMED_IAM \
 			--parameter-overrides \
 				"ProjectName=$(PROJECT_NAME)" \
 				"AppUrls=$$urls" \
@@ -301,13 +303,30 @@ aws-deploy-frontend: ## Deploy the frontend to S3 + CloudFront, built against th
 		dist=$$($(call stack-output,$(FRONTEND_STACK),DistributionId) | tr -d '[:space:]'); \
 		echo "Building the static export against $$api"; \
 		rm -rf frontend/out; \
-		docker build --target export --output type=local,dest=frontend/out \
-			--build-arg NEXT_PUBLIC_API_BASE_URL="$$api" \
-			--build-arg NEXT_PUBLIC_COGNITO_USER_POOL_ID="$$(auth_out UserPoolId)" \
-			--build-arg NEXT_PUBLIC_COGNITO_CLIENT_ID="$$(auth_out UserPoolClientId)" \
-			--build-arg NEXT_PUBLIC_COGNITO_DOMAIN="$$(auth_out HostedDomain)" \
-			--build-arg NEXT_PUBLIC_COGNITO_GOOGLE_ENABLED="$$(auth_out GoogleEnabled)" \
-			./frontend || exit 1; \
+		if docker info >/dev/null 2>&1; then \
+			docker build --target export --output type=local,dest=frontend/out \
+				--build-arg NEXT_PUBLIC_API_BASE_URL="$$api" \
+				--build-arg NEXT_PUBLIC_COGNITO_USER_POOL_ID="$$(auth_out UserPoolId)" \
+				--build-arg NEXT_PUBLIC_COGNITO_CLIENT_ID="$$(auth_out UserPoolClientId)" \
+				--build-arg NEXT_PUBLIC_COGNITO_DOMAIN="$$(auth_out HostedDomain)" \
+				--build-arg NEXT_PUBLIC_COGNITO_DOMAIN_PREFIX="$$(auth_out DomainPrefix)" \
+				--build-arg NEXT_PUBLIC_AWS_REGION="$(AWS_REGION)" \
+				--build-arg NEXT_PUBLIC_COGNITO_GOOGLE_ENABLED="$$(auth_out GoogleEnabled)" \
+				./frontend || exit 1; \
+		else \
+			echo "Docker daemon not running, building export with npm..."; \
+			(cd frontend && \
+				NEXT_TELEMETRY_DISABLED=1 \
+				NEXT_OUTPUT=export \
+				NEXT_PUBLIC_API_BASE_URL="$$api" \
+				NEXT_PUBLIC_COGNITO_USER_POOL_ID="$$(auth_out UserPoolId)" \
+				NEXT_PUBLIC_COGNITO_CLIENT_ID="$$(auth_out UserPoolClientId)" \
+				NEXT_PUBLIC_COGNITO_DOMAIN="$$(auth_out HostedDomain)" \
+				NEXT_PUBLIC_COGNITO_DOMAIN_PREFIX="$$(auth_out DomainPrefix)" \
+				NEXT_PUBLIC_AWS_REGION="$(AWS_REGION)" \
+				NEXT_PUBLIC_COGNITO_GOOGLE_ENABLED="$$(auth_out GoogleEnabled)" \
+				npm run build) || exit 1; \
+		fi; \
 		echo "Uploading to s3://$$bucket"; \
 		$(AWS) s3 sync frontend/out "s3://$$bucket" --delete --exclude "*.html" \
 			--cache-control "public,max-age=31536000,immutable" --only-show-errors || exit 1; \

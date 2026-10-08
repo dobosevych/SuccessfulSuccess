@@ -73,7 +73,6 @@ export function AppHeader({ onCreate }: { onCreate: () => void }) {
         <Plus className="size-4" aria-hidden />
         <span className="hidden sm:inline">New meeting</span>
       </Button>
-      <UserMenu />
     </SiteHeader>
   )
 }

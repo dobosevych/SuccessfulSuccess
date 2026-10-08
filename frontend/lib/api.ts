@@ -1,6 +1,4 @@
-import { signOut } from "aws-amplify/auth"
-
-import { getAccessToken } from "@/lib/auth"
+import { getAccessToken, signOutRedirect } from "@/lib/auth"
 import type {
   ApiErrorBody,
   ApiErrorDetail,
@@ -47,7 +45,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   // The session is gone or was revoked: sign out, and the auth guard sends the
   // user back to the login page.
   if (response.status === 401) {
-    void signOut()
+    void signOutRedirect()
   }
 
   if (response.status === 204) {

@@ -186,6 +186,7 @@ Resources:
     Properties:
       DBClusterIdentifier: !Sub "${ProjectName}-db"
       Engine: aurora-postgresql
+      EngineMode: provisioned
       EngineVersion: !If [HasDbEngineVersion, !Ref DbEngineVersion, !Ref "AWS::NoValue"]
       DatabaseName: !Ref DbName
       MasterUsername: !Ref DbUsername
@@ -193,6 +194,7 @@ Resources:
       DBSubnetGroupName: !Ref DbSubnetGroup
       VpcSecurityGroupIds:
         - !Ref DbSecurityGroup
+      EnableHttpEndpoint: true
       StorageEncrypted: true
       BackupRetentionPeriod: 1        # Aurora's minimum; the continuous backup is free up to the cluster size
       DeletionProtection: false

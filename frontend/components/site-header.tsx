@@ -1,7 +1,11 @@
+"use client"
+
 import { CalendarDays } from "lucide-react"
 import Link from "next/link"
 
-/** Shared top bar: the same logo, height, width and frosted background on every page. */
+import { useAuth } from "@/components/auth-provider"
+import { Button } from "@/components/ui/button"
+
 export function SiteHeader({
   href = "/",
   children,
@@ -9,6 +13,9 @@ export function SiteHeader({
   href?: string
   children?: React.ReactNode
 }) {
+  const { user, isAuthenticated, isLoading, signOut } = useAuth()
+  const email = user?.email
+
   return (
     <header className="bg-background/70 supports-[backdrop-filter]:bg-background/60 sticky top-0 z-40 border-b backdrop-blur-xl">
       <div className="mx-auto flex h-[4.5rem] max-w-6xl items-center gap-3 px-4 sm:px-6 lg:px-8">
@@ -24,8 +31,32 @@ export function SiteHeader({
           </span>
           <span className="hidden text-[0.95rem] sm:inline">SuccessfulSuccess</span>
         </Link>
+
         {children}
+
+        <div className="ml-auto flex items-center gap-3">
+          {!isLoading && isAuthenticated && email ? (
+            <>
+              <span className="text-muted-foreground hidden text-sm font-medium sm:inline">
+                {email}
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void signOut()}
+              >
+                Sign Out
+              </Button>
+            </>
+          ) : !isLoading && !isAuthenticated ? (
+            <Button size="sm" asChild>
+              <Link href="/login">Sign In</Link>
+            </Button>
+          ) : null}
+        </div>
       </div>
     </header>
   )
 }
+
+export { SiteHeader as Header }
