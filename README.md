@@ -26,17 +26,18 @@ Then open:
 
 The backend applies migrations on start.
 
-### Sign-in (Cognito)
+### Sign-in & Infrastructure (Terraform + HCP Terraform)
 
-Every page except the login page, and every `/api/v1` endpoint, needs a
-signed-in user, and each user sees only their own meetings. Sign-in is an AWS
-Cognito user pool (`infra/auth.yml`): email + password, and Google when it is
-configured. Even for local development the pool lives in AWS (it is free at
-this scale):
+Infrastructure is managed with **Terraform** (`infra/*.tf`) and deployed automatically via **HCP Terraform** (Terraform Cloud) upon merging into `main`.
+- `infra/auth.tf` — Cognito user pool (email + password, optional Google OAuth federation)
+- `infra/reports.tf` — Weekly meeting reports S3 bucket, lifecycle policies, and Lambda generator
+- `infra/ai.tf` — AI agenda parser Lambda function and Function URL
+
+To inspect or configure authentication for local development:
 
 ```bash
-make aws-deploy-auth   # create/update the user pool; allows http://localhost:$FRONTEND_PORT/
-make aws-auth-env      # prints COGNITO_* lines: paste them into .env
+make infra-plan        # preview planned infrastructure changes
+make aws-auth-env      # prints COGNITO_* lines from Terraform outputs: paste them into .env
 docker compose up -d   # restart so the API and the frontend pick them up
 ```
 
@@ -359,7 +360,8 @@ sent, so every client shows the same time as the day it was listed under.
 ```
 backend/    FastAPI app (api → services → repositories → models), Alembic, tests
 frontend/   Next.js app, shadcn/ui primitives in components/ui
-infra/      CloudFormation templates behind the aws-* targets
+infra/      Terraform configuration (versions.tf, variables.tf, auth.tf, reports.tf, ai.tf, outputs.tf)
+docs/adr/   Architecture Decision Records (0007-terraform.md)
 docker-compose.yml
 ```
 

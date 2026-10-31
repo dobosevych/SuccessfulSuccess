@@ -93,8 +93,8 @@ define require-db-password
 endef
 
 .PHONY: help up up-build down down-v logs ps migrate revision seed test lint fmt shell-backend psql \
-        aws-whoami aws-deploy aws-deploy-auth aws-auth-env aws-ecr aws-push aws-deploy-backend aws-migrate aws-url aws-status aws-logs \
-        aws-frontend-cert aws-deploy-frontend aws-frontend-url aws-destroy
+        aws-whoami aws-deploy aws-auth-env aws-ecr aws-push aws-deploy-backend aws-migrate aws-url aws-status aws-logs \
+        aws-frontend-cert aws-deploy-frontend aws-frontend-url aws-destroy infra-init infra-plan infra-fmt
 
 help:
 	@grep -hE '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -150,42 +150,26 @@ aws-whoami: ## Verify the AWS credentials in .env
 	$(require-aws-credentials)
 	$(AWS) sts get-caller-identity
 
-aws-deploy: ## Deploy everything: sign-in, then the backend, then the frontend built against both
-	@$(MAKE) --no-print-directory aws-deploy-auth
+aws-deploy: ## Deploy everything: preview infra, then the backend, then the frontend
+	@$(MAKE) --no-print-directory infra-plan
 	@$(MAKE) --no-print-directory aws-deploy-backend
 	@$(MAKE) --no-print-directory aws-deploy-frontend
 
-aws-deploy-auth: ## Create/update the Cognito user pool (email + password; Google when GOOGLE_CLIENT_ID is set)
-	$(require-aws-credentials)
-	@urls="http://localhost:$(or $(FRONTEND_PORT),3000)/"; \
-		site=$$($(call stack-output,$(FRONTEND_STACK),AllowedOrigins) 2>/dev/null | tr -d '[:space:]'); \
-		case "$$site" in ""|None) ;; *) urls="$$urls,$$(echo "$$site" | sed 's|,|/,|g')/" ;; esac; \
-		echo "Sign-in redirect URLs: $$urls"; \
-		test -n "$(GOOGLE_CLIENT_ID)" || echo "GOOGLE_CLIENT_ID is empty — Google sign-in stays off"; \
-		$(call wait-stack-idle,$(AUTH_STACK)); \
-		$(call clear-failed-create,$(AUTH_STACK)); \
-		$(AWS) cloudformation deploy \
-			--stack-name $(AUTH_STACK) \
-			--template-file infra/auth.yml \
-			--no-fail-on-empty-changeset \
-			$(STACK_TAGS) \
-			--parameter-overrides \
-				"ProjectName=$(PROJECT_NAME)" \
-				"AppUrls=$$urls" \
-				"GoogleClientId=$(GOOGLE_CLIENT_ID)" \
-				"GoogleClientSecret=$(GOOGLE_CLIENT_SECRET)"
-	@if [ -n "$(GOOGLE_CLIENT_ID)" ]; then \
-		echo "Google Cloud console → the OAuth client → Authorized redirect URIs must include:"; \
-		echo "  $$($(call stack-output,$(AUTH_STACK),GoogleRedirectUri) | tr -d '[:space:]')"; \
-	fi
-	@$(MAKE) --no-print-directory aws-auth-env
+infra-init: ## Initialize Terraform in infra/
+	cd infra && terraform init
+
+infra-plan: ## Preview infrastructure changes (applies happen via HCP Terraform on merge)
+	cd infra && terraform plan
+
+infra-fmt: ## Check formatting of Terraform files
+	cd infra && terraform fmt -check
 
 aws-auth-env: ## Print the Cognito settings to put in .env for local development
-	@$(call stack-outputs,$(AUTH_STACK)) | awk -F '\t' ' \
-		$$1 == "UserPoolId" { print "COGNITO_USER_POOL_ID=" $$2 } \
-		$$1 == "UserPoolClientId" { print "COGNITO_CLIENT_ID=" $$2 } \
-		$$1 == "HostedDomain" { print "COGNITO_DOMAIN=" $$2 } \
-		$$1 == "GoogleEnabled" { print "COGNITO_GOOGLE_ENABLED=" $$2 }' | tr -d '\r'
+	@cd infra && printf "COGNITO_USER_POOL_ID=%s\nCOGNITO_CLIENT_ID=%s\nCOGNITO_DOMAIN=%s\nCOGNITO_GOOGLE_ENABLED=%s\n" \
+		"$$(terraform output -raw user_pool_id 2>/dev/null)" \
+		"$$(terraform output -raw user_pool_client_id 2>/dev/null)" \
+		"$$(terraform output -raw hosted_domain 2>/dev/null)" \
+		"$$(terraform output -raw google_enabled 2>/dev/null)" | tr -d '\r'
 
 aws-ecr: ## Create the ECR repository for the backend image
 	$(require-aws-credentials)
@@ -208,10 +192,10 @@ aws-push: aws-ecr ## Build the backend Lambda image and push it to ECR
 aws-deploy-backend: aws-push ## Deploy the backend to AWS (Lambda function URL + Aurora Serverless), then migrate
 	$(require-aws-credentials)
 	$(require-db-password)
-	@pool=$$($(call stack-output,$(AUTH_STACK),UserPoolId) 2>/dev/null | tr -d '[:space:]'); \
-		client=$$($(call stack-output,$(AUTH_STACK),UserPoolClientId) | tr -d '[:space:]'); \
-		issuer=$$($(call stack-output,$(AUTH_STACK),Issuer) | tr -d '[:space:]'); \
-		case "$$pool" in ""|None) echo "No user pool found — run: make aws-deploy-auth"; exit 1 ;; esac; \
+	@pool=$$(cd infra && terraform output -raw user_pool_id 2>/dev/null | tr -d '[:space:]'); \
+		client=$$(cd infra && terraform output -raw user_pool_client_id 2>/dev/null | tr -d '[:space:]'); \
+		issuer=$$(cd infra && terraform output -raw issuer 2>/dev/null | tr -d '[:space:]'); \
+		case "$$pool" in ""|None) echo "No user pool found — run: make infra-plan and apply via HCP Terraform"; exit 1 ;; esac; \
 		jwks=$$(curl -fsS "$$issuer/.well-known/jwks.json" | base64 | tr -d '\n'); \
 		test -n "$$jwks" || { echo "Could not download $$issuer/.well-known/jwks.json"; exit 1; }; \
 		vpc=$$($(AWS) ec2 describe-vpcs --filters Name=isDefault,Values=true \
@@ -310,21 +294,22 @@ aws-deploy-frontend: ## Deploy the frontend to S3 + CloudFront, built against th
 				"ProjectName=$(PROJECT_NAME)" \
 				"PricingPlan=$(or $(AWS_CLOUDFRONT_PLAN),FREE)" \
 				$$domain
-	@# Now that the site's URL exists, let Cognito redirect back to it.
-	@$(MAKE) --no-print-directory aws-deploy-auth
+	@# Now that the site's URL exists, note that redirect URLs are configured in infra/
 	@api=$$($(call stack-output,$(APP_STACK),ApiUrl) | tr -d '[:space:]'); \
-		auth=$$($(call stack-outputs,$(AUTH_STACK)) | tr -d '\r'); \
-		auth_out() { printf '%s\n' "$$auth" | awk -F '\t' -v k="$$1" '$$1 == k { print $$2 }'; }; \
+		pool=$$(cd infra && terraform output -raw user_pool_id 2>/dev/null | tr -d '[:space:]'); \
+		client=$$(cd infra && terraform output -raw user_pool_client_id 2>/dev/null | tr -d '[:space:]'); \
+		domain=$$(cd infra && terraform output -raw hosted_domain 2>/dev/null | tr -d '[:space:]'); \
+		google=$$(cd infra && terraform output -raw google_enabled 2>/dev/null | tr -d '[:space:]'); \
 		bucket=$$($(call stack-output,$(FRONTEND_STACK),BucketName) | tr -d '[:space:]'); \
 		dist=$$($(call stack-output,$(FRONTEND_STACK),DistributionId) | tr -d '[:space:]'); \
 		echo "Building the static export against $$api"; \
 		rm -rf frontend/out; \
 		docker build --target export --output type=local,dest=frontend/out \
 			--build-arg NEXT_PUBLIC_API_BASE_URL="$$api" \
-			--build-arg NEXT_PUBLIC_COGNITO_USER_POOL_ID="$$(auth_out UserPoolId)" \
-			--build-arg NEXT_PUBLIC_COGNITO_CLIENT_ID="$$(auth_out UserPoolClientId)" \
-			--build-arg NEXT_PUBLIC_COGNITO_DOMAIN="$$(auth_out HostedDomain)" \
-			--build-arg NEXT_PUBLIC_COGNITO_GOOGLE_ENABLED="$$(auth_out GoogleEnabled)" \
+			--build-arg NEXT_PUBLIC_COGNITO_USER_POOL_ID="$$pool" \
+			--build-arg NEXT_PUBLIC_COGNITO_CLIENT_ID="$$client" \
+			--build-arg NEXT_PUBLIC_COGNITO_DOMAIN="$$domain" \
+			--build-arg NEXT_PUBLIC_COGNITO_GOOGLE_ENABLED="$$google" \
 			./frontend || exit 1; \
 		echo "Uploading to s3://$$bucket"; \
 		$(AWS) s3 sync frontend/out "s3://$$bucket" --delete --exclude "*.html" \
